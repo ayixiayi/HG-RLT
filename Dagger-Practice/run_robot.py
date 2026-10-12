@@ -217,7 +217,8 @@ def preflight(args):
 
         if sealed is None or not sealed["run"]["inference"].get("rl_token"):
             raise ValueError("--rlt 需要用 --rl-token 训练并封存的模型（--deployment）")
-        rl_config = rlt.RLTConfig()
+        # One config per RLT run, shared with rlt-learn (RUN/config.json).
+        rl_config = rlt.run_config(args.rlt)
         metadata.update(
             rlt={
                 "run": str(Path(args.rlt).resolve()),
@@ -647,7 +648,10 @@ def run_loop(
                     control.control("s", now=clock.monotonic(), qpos=snap.qpos)
                     # Do not let a handback queued before rejection restart it.
                     pending_keys.extend(poll())
-                    pending_keys[:] = [k for k in pending_keys if k not in {"h", "p"}]
+                    # Any queued start (h / p / r, incl. key repeat) is stale now.
+                    pending_keys[:] = [
+                        k for k in pending_keys if k not in {"h", "p", "r"}
+                    ]
                     event(reason, force=True)
                     message(
                         "跟随卡住" if isinstance(exc, TrackingStalled) else "策略拒绝",

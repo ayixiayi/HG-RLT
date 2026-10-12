@@ -249,4 +249,5 @@ cd "$HOME/Project/HG-RLT"
 HG 与 RLT 一起用：每轮 HG 训练加 `--rl-token`，回传的模型同时用于 HG 采集和 RLT；同一次 `collect` 里 `p` / `r` / `h` 可以混用，人工接管照常进入下一轮 HG 数据。
 每换一个模型（HG 新一轮），RLT 用新的 `--rlt` 目录和录制目录重新开始。
 learner 每收到一条标好的录制就更新并发布 actor，采集在动作块边界自动换上新版本；replay 累计 64 条决策后开始训练，之前 actor 等同 VLA。
+learner 可以随时 Ctrl-C 后重启，从 `data/rlt/heavier-rlt1/learner.pkl` 继续；该文件丢失时 learner 拒绝覆盖已有 actor，需要换新的 `--run` 目录。
 actor 输出离 VLA 参考动作最多 0.15 rad，并照常经过全部安全检查。本版 replay 只收录 RL 执行段，人工接管段继续用于 HG 训练。

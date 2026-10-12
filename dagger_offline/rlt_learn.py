@@ -37,7 +37,17 @@ def read_episode(path):
             "fail",
         ):
             return None
+        if not attrs.get("usable", False) or attrs.get("unusable", True):
+            return {"attrs": attrs, "unusable": True}
+        discards = []
+        if "discard_segments" in f:
+            g = f["discard_segments"]
+            discards = list(
+                zip(g["start_ns"][()].tolist(), g["end_ns"][()].tolist(), strict=True)
+            )
         episode = {
+            "discards": discards,
+            "row_ns": f["timestamps/top"][()],
             "attrs": attrs,
             "metadata": json.loads(attrs["metadata_json"]),
             "sent": f["pairing/command_sent_ns"][()],
@@ -69,26 +79,45 @@ def chain_transitions(episode, decisions, config):
         )
     ]
     takeovers = event_ns[episode["event_state"] == "INTERVENTION"]
+    discards = episode.get("discards", [])
+    discard_starts = np.array([a for a, _ in discards], dtype=np.int64)
+    # An operator-discarded interval (c ... x) ends any run crossing into it.
+    boundaries = np.sort(np.concatenate([boundaries, discard_starts]))
+    row_ns = episode.get("row_ns")
     d = decisions
     count = len(d["accepted_ns"])
     rows = []
     for i in range(count):
+        observed = int(d["observed_ns"][i])
         start = int(d["accepted_ns"][i])
-        stop = int(d["accepted_ns"][i + 1]) if i + 1 < count else None
-        cut = boundaries[boundaries > start]
+        # The transition ends where the next decision's state was observed:
+        # commands sent after that belong to the next state's dynamics.
+        stop = int(d["observed_ns"][i + 1]) if i + 1 < count else None
+        cut = boundaries[boundaries > observed]
         run_end = int(cut[0]) if len(cut) else None
         limits = [x for x in (stop, run_end) if x is not None]
+        end = min(limits) if limits else None
+        if any(
+            a < (end if end is not None else 2**63) and b > observed
+            for a, b in discards
+        ):
+            continue  # touches an operator-discarded interval
         window = (sent >= start) & valid & (sent > 0)
-        if limits:
-            window &= sent < min(limits)
+        if end is not None:
+            window &= sent < end
         ran = commands[window]
         if len(ran) == 0:
             continue
+        if row_ns is not None and end is not None:
+            elapsed = int(np.sum((row_ns >= observed) & (row_ns < end)))
+        else:
+            elapsed = len(ran)
         executed = ran[: config.chunk]
         qpos = d["proprio"][i][: rlt.JOINTS]
         planned = np.array(d["planned"][i], dtype=np.float64)
         planned[: len(executed)] = executed
         chained = stop is not None and (run_end is None or stop < run_end)
+        discarded_next = run_end is not None and run_end in set(discard_starts.tolist())
         if chained:
             j = i + 1
             next_ref = rlt.to_residual(
@@ -101,7 +130,8 @@ def chain_transitions(episode, decisions, config):
             next_ref = np.zeros(config.action_dim, np.float32)
             next_token = np.zeros_like(d["token"][i])
             next_proprio = np.zeros(rlt.PROPRIO, np.float32)
-            reward, done = (1.0 if success and not helped else 0.0), 1.0
+            credited = success and not helped and not discarded_next
+            reward, done = (1.0 if credited else 0.0), 1.0
         rows.append(
             {
                 "token": d["token"][i],
@@ -111,7 +141,7 @@ def chain_transitions(episode, decisions, config):
                 "reward": reward,
                 # Elapsed control steps until the next decision (may exceed C
                 # when the VLA kept executing its longer chunk).
-                "discount": config.gamma ** len(ran),
+                "discount": config.gamma ** max(elapsed, 1),
                 "done": done,
                 "next_token": next_token,
                 "next_proprio": next_proprio,
@@ -128,7 +158,7 @@ def episode_transitions(path, config, policy_id=None):
     episode = read_episode(path)
     if episode is None:
         return None
-    if "rl_decisions" not in episode:
+    if episode.get("unusable") or "rl_decisions" not in episode:
         return []
     policy = episode["metadata"].get("rlt", {}).get("policy_id")
     if policy_id is not None and policy != policy_id:
@@ -167,31 +197,58 @@ def sync_replay(recordings, replay_dir, config, policy_id=None):
     return added
 
 
-def learn(recordings, run, config, *, min_transitions=64, poll_s=10.0, once=False):
+def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once=False):
+    """``config`` overrides RUN/config.json training parameters only."""
     run = Path(run)
-    replay_dir, actor_dir = run / "replay", run / "actor"
+    config = rlt.run_config(run, config)
+    replay_dir, actor_dir, state_path = (
+        run / "replay",
+        run / "actor",
+        run / "learner.pkl",
+    )
     learner = rlt.Learner(config)
-    version = 0
+    if state_path.exists():
+        version, processed = learner.load_state(state_path)
+        message(
+            "RLT learner",
+            f"恢复训练状态：actor v{version} · 已训练 {len(processed)} 个分片",
+        )
+    elif (actor_dir / "actor.npz").exists():
+        raise RuntimeError(
+            f"{actor_dir} 已有 actor 但缺少训练状态 {state_path}；拒绝覆盖。换新的 --run 目录重新开始"
+        )
+    else:
+        version, processed = 0, set()
     message("RLT learner", f"录制 {recordings} → {run}；等待带 RL 决策的已标注录制")
     while True:
         marker = run / "model.json"
         policy_id = (
             json.loads(marker.read_text())["policy_id"] if marker.exists() else None
         )
-        added = sync_replay(recordings, replay_dir, config, policy_id)
+        sync_replay(recordings, replay_dir, config, policy_id)
+        shards = (
+            {p.name for p in replay_dir.glob("*.npz")} if replay_dir.exists() else set()
+        )
+        fresh = sorted(shards - processed)
         replay = rlt.load_replay(replay_dir, config)
         size = 0 if replay is None else len(replay["token"])
-        if added and size >= min_transitions:
+        if fresh and size >= min_transitions:
+            added = 0
+            for name in fresh:
+                with np.load(replay_dir / name) as shard:
+                    added += len(shard["token"])
             log = learner.train(replay, steps=added)
             version += 1
             rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
+            processed |= set(fresh)
+            learner.save_state(state_path, version=version, processed=processed)
             message(
                 "RLT learner",
                 f"actor v{version} 已发布 · replay {size} · 新增 {added} · "
                 + " · ".join(f"{k}={v:.3f}" for k, v in log.items()),
                 level="success",
             )
-        elif added:
+        elif fresh:
             message(
                 "RLT learner", f"replay {size} 条，攒够 {min_transitions} 条后开始训练"
             )
@@ -208,21 +265,23 @@ def main(argv=None):
         "--recordings", type=Path, required=True, help="collect 的 --output-dir"
     )
     parser.add_argument(
-        "--run", type=Path, required=True, help="RLT 运行目录（replay/ 和 actor/）"
+        "--run", type=Path, required=True, help="RLT 运行目录（与 collect --rlt 相同）"
     )
-    parser.add_argument("--config", type=Path, help="RLTConfig JSON；默认使用内置配置")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="RLTConfig JSON；只能修改训练超参数，结构参数以运行目录的 config.json 为准",
+    )
     parser.add_argument("--min-transitions", type=int, default=64)
     parser.add_argument("--once", action="store_true", help="只同步训练一次后退出")
     args = parser.parse_args(argv)
-    config = (
-        rlt.RLTConfig(**json.loads(args.config.read_text()))
-        if args.config
-        else rlt.RLTConfig()
+    override = (
+        rlt.RLTConfig(**json.loads(args.config.read_text())) if args.config else None
     )
     learn(
         args.recordings,
         args.run,
-        config,
+        override,
         min_transitions=args.min_transitions,
         once=args.once,
     )

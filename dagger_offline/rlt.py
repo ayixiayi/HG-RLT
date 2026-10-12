@@ -67,10 +67,25 @@ class RLTConfig:
     def state_dim(self):
         return self.token_dim + PROPRIO
 
+    # Fields that change what a published actor means / what replay contains.
+    # Training hyperparameters (lr, beta, utd, ...) may change between runs.
+    ACTOR_FIELDS = ("token_dim", "chunk", "hidden", "layers", "action_scale")
+    REPLAY_FIELDS = ("token_dim", "chunk", "action_scale", "gamma")
+
+    def _hash(self, fields):
+        values = {k: getattr(self, k) for k in fields}
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[
+            :16
+        ]
+
+    def actor_digest(self):
+        return self._hash(self.ACTOR_FIELDS)
+
+    def replay_digest(self):
+        return self._hash(self.REPLAY_FIELDS)
+
     def digest(self):
-        return hashlib.sha256(
-            json.dumps(dataclasses.asdict(self), sort_keys=True).encode()
-        ).hexdigest()[:16]
+        return self._hash(tuple(f.name for f in dataclasses.fields(self)))
 
 
 # ---------------------------------------------------------------- features
@@ -212,6 +227,44 @@ def bind_run(run, policy_id):
     marker.write_text(json.dumps({"policy_id": policy_id}) + "\n")
 
 
+def _atomic_write(path, data: bytes):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as f:
+        temporary = Path(f.name)
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
+
+
+def run_config(run, override=None):
+    """The RLT config shared by the collector and the learner (RUN/config.json).
+
+    The first user creates it (defaults or ``override``). Later, training
+    hyperparameters may change; the network / action / replay layout may not.
+    """
+    path = Path(run) / "config.json"
+    if path.exists():
+        stored = RLTConfig(**json.loads(path.read_text()))
+        if override is None or override == stored:
+            return stored
+        if (
+            override.actor_digest() != stored.actor_digest()
+            or override.replay_digest() != stored.replay_digest()
+        ):
+            raise ValueError(
+                f"{path}: 网络结构/动作/回放参数与该 RLT 运行目录不一致；请用新目录"
+            )
+        config = override  # training hyperparameters only
+    else:
+        config = override or RLTConfig()
+    _atomic_write(
+        path, (json.dumps(dataclasses.asdict(config), indent=2) + "\n").encode()
+    )
+    return config
+
+
 # ---------------------------------------------------------------- publication
 
 
@@ -222,7 +275,11 @@ def publish_actor(directory, config, params, version):
     payload = {f"p_{k}": v for k, v in params.items()}
     payload["meta"] = np.frombuffer(
         json.dumps(
-            {"version": int(version), "config": config.digest(), "time": time.time()}
+            {
+                "version": int(version),
+                "config": config.actor_digest(),
+                "time": time.time(),
+            }
         ).encode(),
         dtype=np.uint8,
     )
@@ -238,7 +295,7 @@ def load_actor(directory, config):
     path = Path(directory) / "actor.npz"
     with np.load(path) as data:
         meta = json.loads(bytes(data["meta"]).decode())
-        if meta["config"] != config.digest():
+        if meta["config"] != config.actor_digest():
             raise ValueError("Published actor was trained with a different RLT config")
         params = {k[2:]: data[k].copy() for k in data.files if k.startswith("p_")}
     return params, meta["version"]
@@ -297,7 +354,7 @@ class ReplayWriter:
             temporary = Path(f.name)
             np.savez(
                 f,
-                config=np.frombuffer(self.config.digest().encode(), np.uint8),
+                config=np.frombuffer(self.config.replay_digest().encode(), np.uint8),
                 **arrays,
             )
         os.replace(temporary, target)
@@ -309,7 +366,7 @@ def load_replay(directory, config):
     parts = {k: [] for k in TRANSITION_FIELDS}
     for shard in shards:
         with np.load(shard) as data:
-            if bytes(data["config"]).decode() != config.digest():
+            if bytes(data["config"]).decode() != config.replay_digest():
                 raise ValueError(
                     f"{shard.name}: replay written with another RLT config"
                 )
@@ -451,3 +508,50 @@ class Learner:
 
     def actor_numpy(self):
         return {k: np.asarray(v) for k, v in self.actor.items()}
+
+    def save_state(self, path, *, version, processed):
+        """Everything needed to continue training exactly (atomic)."""
+        import pickle
+
+        jax = self.jax
+        state = {
+            "actor_digest": self.config.actor_digest(),
+            "replay_digest": self.config.replay_digest(),
+            "version": int(version),
+            "processed": sorted(processed),
+            "updates": self.updates,
+            "key": np.asarray(jax.random.key_data(self.key)),
+            "trees": jax.device_get(
+                {
+                    "actor": self.actor,
+                    "critics": self.critics,
+                    "target_actor": self.target_actor,
+                    "target_critics": self.target_critics,
+                    "actor_state": self.actor_state,
+                    "critic_state": self.critic_state,
+                }
+            ),
+        }
+        _atomic_write(path, pickle.dumps(state))
+
+    def load_state(self, path):
+        import pickle
+
+        jax, jnp = self.jax, self.jnp
+        state = pickle.loads(Path(path).read_bytes())
+        if (
+            state["actor_digest"] != self.config.actor_digest()
+            or state["replay_digest"] != self.config.replay_digest()
+        ):
+            raise ValueError("Saved learner state belongs to a different RLT config")
+        trees = jax.tree.map(jnp.asarray, state["trees"])
+        self.actor, self.critics = trees["actor"], list(trees["critics"])
+        self.target_actor = trees["target_actor"]
+        self.target_critics = list(trees["target_critics"])
+        self.actor_state, self.critic_state = (
+            trees["actor_state"],
+            trees["critic_state"],
+        )
+        self.updates = int(state["updates"])
+        self.key = jax.random.wrap_key_data(jnp.asarray(state["key"]))
+        return state["version"], set(state["processed"])

@@ -146,8 +146,11 @@ J4 在正常遥操作中就有较大跟随误差（p95 左 0.195、右 0.125 rad
 | `collect --rlt DIR` | 启用 `r` 键；必须配合该模型的 `--deployment` |
 | `r` | 交给 RL actor：每个 10 步动作块由 actor 根据（RL token、关节状态、VLA 参考块）给出，剩 3 步时预取下一块 |
 | `p` / `h` / `s` | 回到 VLA / 准备接管 / HOLD，含义不变 |
-| `rlt-learn --recordings DIR --run DIR` | 另开终端；读取已标注录制生成 replay，TD3 训练后原子发布 `DIR/actor/actor.npz` |
+| `rlt-learn --recordings DIR --run DIR` | 另开终端；读取已标注录制生成 replay，TD3 训练后原子发布 `DIR/actor/actor.npz`，同时保存完整训练状态 `DIR/learner.pkl`；重启后从该状态继续，版本号接续 |
+| `DIR/config.json` | 采集端和 learner 共用的 RLT 配置，第一次使用时生成；`rlt-learn --config` 只能修改训练超参数（学习率、β 等），网络结构、动作块长度等需要新目录 |
 | 奖励 | 每段 RL 执行的最后一个决策：本条标成功、且这段之后没有人工接管 → +1；之后有人工接管或标失败 → 0。用 `p` 交回 VLA 收尾、`s` 暂停都保留这份奖励 |
+| 丢弃 | `c` / `x` 丢弃的区间不进入 replay，跨入该区间的 RL 执行段在区间前结束且不得奖励；整条弃用的录制不进入 replay |
+| 时序 | 每个决策的执行动作截止到下一个决策的观测时刻，折扣按两次观测之间的控制步数计算 |
 | 运行目录与模型 | `--rlt DIR` 第一次使用时绑定当前封存模型；换模型（例如 HG 新一轮）用新目录，旧 replay 的 RL token 与新模型不通用 |
 | 安全 | actor 输出与参考块偏差 ≤0.15 rad（夹爪 0.30），之后照常经过第 2.5 节全部检查 |
 

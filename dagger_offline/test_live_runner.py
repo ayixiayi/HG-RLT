@@ -2139,3 +2139,92 @@ def test_r_without_rlt_is_ignored_and_rl_needs_token(tmp_path):
     )
     with pytest.raises((RuntimeError, BaseExceptionGroup)):
         h.run()
+
+
+def _rl_harness(path, keys, run, config):
+    from dagger_offline import rlt
+    from dagger_offline.live_control import Controller
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h = Harness(path, keys)
+    h.worker = TokenWorker(h)
+    h.control = Controller(
+        h.relative,
+        h.worker,
+        now=h.clock.monotonic(),
+        rl=rlt.RLAgent(config, run / "actor"),
+        rl_lead=3,
+    )
+    return h
+
+
+def test_rejection_drops_a_queued_r_and_stays_held(tmp_path):
+    from dagger_offline import rlt
+
+    config = rlt.RLTConfig(token_dim=8, hidden=32)
+    h = _rl_harness(
+        tmp_path / "rej.h5", {0: ["r"], 80: ["k"]}, tmp_path / "run", config
+    )
+    plan = h.plan
+    rejected = []
+
+    def reject_once(reference, target, limits, **kwargs):
+        if not rejected and h.control.owner is Ownership.POLICY:
+            rejected.append(h.clock.tick)
+            h.inbox.extend(["r", "r"])  # queued start + key repeat
+            return SimpleNamespace(applied_action=reference, violations=["injected"])
+        return plan(reference, target, limits, **kwargs)
+
+    h.sender.plan = reject_once
+    h.run()
+    assert rejected
+    assert not any(t >= rejected[0] for t, _, _ in h.sent)
+
+
+def test_discarded_rl_segment_never_reaches_replay(tmp_path):
+    pytest.importorskip("jax")
+    from dagger_offline import rlt, rlt_learn
+
+    config = rlt.RLTConfig(token_dim=8, hidden=32, batch=32)
+    path = tmp_path / "rec/episodes/episode-000001.h5"
+    # c, RL runs, x discards it, RL again, success.
+    h = _rl_harness(
+        path,
+        {0: ["c"], 2: ["r"], 60: ["x"], 70: ["r"], 140: ["k"]},
+        tmp_path / "run",
+        config,
+    )
+    h.run(review=lambda: "success", metadata={"collection": {"group": "g"}})
+    with h5py.File(path) as f:
+        start, end = f["discard_segments/start_ns"][0], f["discard_segments/end_ns"][0]
+        observed = f["rl_decisions/observed_ns"][:]
+    inside = int(np.sum((observed >= start) & (observed < end)))
+    assert inside > 0
+    rows = rlt_learn.episode_transitions(path, config)
+    assert 0 < len(rows) <= len(observed) - inside
+    # Exactly one successful terminal: the run after the discard.
+    assert sum(r["reward"] for r in rows) == 1.0
+
+
+def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path):
+    pytest.importorskip("jax")
+    from dagger_offline import rlt, rlt_learn
+
+    config = rlt.RLTConfig(token_dim=8, hidden=32, batch=32)
+    run, recordings = tmp_path / "run", tmp_path / "rec"
+    for i in (1, 2):
+        h = _rl_harness(
+            recordings / f"episodes/episode-00000{i}.h5",
+            {0: ["r"], 90: ["k"]},
+            run,
+            config,
+        )
+        h.run(review=lambda: "success", metadata={"collection": {"group": str(i)}})
+        version = rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
+        assert version == i  # the restarted learner continues the version
+    state = (run / "learner.pkl").read_bytes()
+    (run / "learner.pkl").unlink()
+    with pytest.raises(RuntimeError, match="拒绝覆盖"):
+        rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
+    (run / "learner.pkl").write_bytes(state)
+    assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 2
