@@ -1,0 +1,52 @@
+# Python 3.12: CPU data-path validation only, not a GPU training/runtime lock.
+# Use clean pinned OpenPI + LeRobot sources on PYTHONPATH (see HG handoff).
+# Install the +cpu wheels from https://download.pytorch.org/whl/cpu.
+# Keep this environment separate from requirements-cpu.txt (ABC/Mink, numpy 2).
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
+torchcodec==0.3.0
+numpy==1.26.4
+datasets==3.6.0
+# PyArrow 26 rejects numpy 1 at import despite its package metadata.
+pyarrow==25.0.1
+pandas==2.3.3
+huggingface-hub==0.35.3
+fsspec[http,gcs]==2025.3.0
+gcsfs==2025.3.0
+av==15.1.0
+opencv-python-headless==4.11.0.86
+mcap==1.4.0
+h5py==3.16.0
+pytest==9.1.1
+PyYAML==6.0.3
+pyzmq==27.2.0
+msgpack==1.2.2
+# Real RhOS websocket serving adapter in the no-hardware end-to-end test.
+msgpack-numpy==0.4.8
+websockets==17.1
+tyro==1.0.16
+jsonlines==4.0.0
+draccus==0.10.0
+termcolor==3.3.0
+einops==0.8.2
+augmax==0.3.4
+dm-tree==0.1.10
+equinox==0.11.12
+flax==0.10.2
+jax==0.5.3
+jaxlib==0.5.3
+jaxtyping==0.2.36
+ml-collections==1.0.0
+numpydantic==1.8.1
+orbax-checkpoint==0.11.13
+optax==0.2.4
+ml-dtypes==0.4.1
+tensorstore==0.1.74
+sentencepiece==0.2.2
+tqdm-loggable==0.4.1
+beartype==0.19.0
+chex==0.1.90
+transformers==4.53.2
+rich==15.0.0
+polars==1.44.2
+wandb==0.30.0

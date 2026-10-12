@@ -1,0 +1,35 @@
+# Installation-owned environments, dependency checkouts and runtime assets.
+/envs/
+/runtime/
+/vendor/
+/configs
+/.venv/
+
+# Experimental inputs, outputs and portable training/model packages.
+/data/
+/models/
+/exports/
+/logs/
+/cache/
+/training/
+/round/
+/parent/
+*.h5
+*.mcap
+*.tar
+*.tar.gz
+*.bundle
+
+# Generated Python files and test caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Machine-local credentials and legacy credential-bearing helpers.
+.env
+.env.*
+!.env.example
+.ossutilconfig*
+ossutil_output/
+/pull_oss_model.py

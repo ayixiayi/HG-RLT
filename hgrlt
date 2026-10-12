@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# One installed entrypoint; relative arguments always belong to this project.
+set -euo pipefail
+ROOT=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+cd -- "$ROOT"
+exec bash "$ROOT/Dagger-Practice/lab.sh" "$@"

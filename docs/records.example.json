@@ -1,0 +1,14 @@
+[
+  {
+    "path": "../data/recordings/r1/episodes/episode-000001.h5",
+    "group": "hg:example-episode-1",
+    "role": "current",
+    "outcome": "success"
+  },
+  {
+    "path": "../data/recordings/r1/episodes/episode-000002.h5",
+    "group": "hg:example-episode-2",
+    "role": "current",
+    "outcome": "fail"
+  }
+]

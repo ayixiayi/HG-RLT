@@ -1,0 +1,77 @@
+--- a/Client/arms/YAM/gello_software/gello/dynamixel/driver.py
++++ b/Client/arms/YAM/gello_software/gello/dynamixel/driver.py
+@@ -100,6 +100,10 @@
+         """Get joint positions (rad) and velocities (rad/s)."""
+         ...
+ 
++    def get_joint_sample(self) -> Tuple[np.ndarray, float]:
++        """Return real joint angles (rad) and their monotonic acquisition time."""
++        ...
++
+     def close(self):
+         """Close the driver."""
+ 
+@@ -147,6 +151,9 @@
+     def get_joints(self) -> np.ndarray:
+         return self._joint_angles.copy()
+ 
++    def get_joint_sample(self) -> Tuple[np.ndarray, float]:
++        raise RuntimeError("Fake Dynamixel driver has no hardware joint sample")
++
+     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
+         return self._joint_angles.copy(), self._velocities.copy()
+ 
+@@ -180,6 +187,8 @@
+         self._ids = ids
+         self._joint_angles = None
+         self._velocities = None
++        self._joint_sample_time = None
++        self._sample_lock = Lock()
+         self._lock = Lock()
+         self._port = port
+         self._baudrate = baudrate
+@@ -488,10 +497,42 @@
+                         raise RuntimeError(
+                             f"Failed to get joint angles for Dynamixel with ID {dxl_id}"
+                         )
+-                self._joint_angles = _joint_angles
+-                self._velocities = _velocities
++                sample_time = time.monotonic()
++                # Publish independently of the serial transaction lock: readers
++                # can use the last complete sample while the next USB read waits.
++                with self._sample_lock:
++                    self._joint_angles = _joint_angles
++                    self._velocities = _velocities
++                    self._joint_sample_time = sample_time
+             # self._groupSyncRead.clearParam()
+ 
++    def get_joint_sample(self) -> Tuple[np.ndarray, float]:
++        """Return a copied hardware sample in radians and its monotonic time.
++
++        Raises RuntimeError for fake, missing/invalid samples or if the sample
++        lock cannot be acquired within 10 ms. Never waits for serial I/O;
++        callers must check the returned timestamp against their freshness limit.
++        """
++        if self._is_fake:
++            raise RuntimeError("Fake Dynamixel driver has no hardware joint sample")
++        if not self._sample_lock.acquire(timeout=0.01):
++            raise RuntimeError("Dynamixel joint sample lock is busy")
++        try:
++            stamp = self._joint_sample_time
++            angles = self._joint_angles
++            if (
++                stamp is None
++                or not np.isfinite(stamp)
++                or stamp < 0
++                or angles is None
++                or angles.shape != (len(self._ids),)
++                or not np.all(np.isfinite(angles))
++            ):
++                raise RuntimeError("No complete valid Dynamixel joint sample")
++            return angles.copy() / 2048.0 * np.pi, stamp
++        finally:
++            self._sample_lock.release()
++
+     def get_positions_and_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
+         if self._is_fake:
+             return self._fake_joint_angles.copy(), self._fake_velocities.copy()

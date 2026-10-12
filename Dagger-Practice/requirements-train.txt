@@ -1,0 +1,4 @@
+# Same tested data adapter, plus the CUDA backend already required by OpenPI.
+# PyTorch stays CPU-only: it loads data; JAX performs Pi0.5 training on the GPU.
+-r requirements-data-cpu.txt
+jax[cuda12]==0.5.3

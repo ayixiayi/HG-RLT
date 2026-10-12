@@ -1,0 +1,77 @@
+diff --git a/Client/arms/YAM/i2rt/i2rt/robots/motor_chain_robot.py b/Client/arms/YAM/i2rt/i2rt/robots/motor_chain_robot.py
+--- a/Client/arms/YAM/i2rt/i2rt/robots/motor_chain_robot.py	2026-10-12 17:11:11.010417287 +0800
++++ b/Client/arms/YAM/i2rt/i2rt/robots/motor_chain_robot.py	2026-10-12 17:11:11.015763297 +0800
+@@ -17,8 +17,6 @@
+ from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
+ from i2rt.utils.mujoco_utils import MuJoCoKDL
+ 
+-# Upper bound on waiting for _state_lock in get_joint_sample (seconds).
+-JOINT_SAMPLE_LOCK_TIMEOUT_S = 0.01
+ 
+ 
+ @dataclass
+@@ -541,21 +539,20 @@
+         different receive times (they are NOT one simultaneous physical sample),
+         and CAN/kernel buffering latency before decode is unmeasured.
+ 
+-        Both vectors are copied together under ``_state_lock``, acquired with a
+-        bounded wait. Raises instead of substituting the current time when the
+-        lock is unavailable or any receive time is missing/invalid. Read-only.
++        Lock-free: the control loop holds ``_state_lock`` across the whole CAN
++        round trip and publishes a new ``JointStates`` object each cycle, whose
++        arrays are never mutated in place. One reference read therefore yields
++        corresponding positions and receive times without contending with the
++        control loop. Freshness is judged by the receive times, not by lock
++        availability. Raises instead of substituting the current time when any
++        receive time is missing/invalid. Read-only.
+         """
+-        if not self._state_lock.acquire(timeout=JOINT_SAMPLE_LOCK_TIMEOUT_S):
+-            raise TimeoutError(f"{self}: joint state lock not acquired within {JOINT_SAMPLE_LOCK_TIMEOUT_S}s")
+-        try:
+-            joint_state = self._joint_state
+-            if joint_state is None:
+-                raise RuntimeError(f"{self}: no joint state has been published")
+-            pos = np.array(joint_state.pos, dtype=float, copy=True)
+-            received = joint_state.received_monotonic_s
+-            received = None if received is None else np.array(received, dtype=float, copy=True)
+-        finally:
+-            self._state_lock.release()
++        joint_state = self._joint_state
++        if joint_state is None:
++            raise RuntimeError(f"{self}: no joint state has been published")
++        pos = np.array(joint_state.pos, dtype=float, copy=True)
++        received = joint_state.received_monotonic_s
++        received = None if received is None else np.array(received, dtype=float, copy=True)
+         if received is None:
+             raise RuntimeError(f"{self}: motor chain did not provide CAN receive times")
+         if pos.ndim != 1 or received.shape != pos.shape:
+diff --git a/tests/test_follower_receive_timestamps.py b/tests/test_follower_receive_timestamps.py
+--- a/tests/test_follower_receive_timestamps.py	2026-10-12 17:11:11.012093044 +0800
++++ b/tests/test_follower_receive_timestamps.py	2026-10-12 17:11:11.015840733 +0800
+@@ -29,7 +29,6 @@
+     ReceiveMode,
+     uint_to_float,
+ )
+-from i2rt.robots import motor_chain_robot as mcr  # noqa: E402
+ from i2rt.robots.motor_chain_robot import JointCommands, MotorChainRobot  # noqa: E402
+ from i2rt.robots.utils import JointMapper  # noqa: E402
+ 
+@@ -275,13 +274,14 @@
+     assert fresh["joint_state"][1] != -99.0 and fresh["received_monotonic_s"][1] != -99.0
+     assert sample["joint_state"][0] == -99.0
+ 
+-    assert mcr.JOINT_SAMPLE_LOCK_TIMEOUT_S <= 0.01
++    # The control loop holds _state_lock through each CAN round trip; a sample
++    # read must not wait on it (a 10 ms wait latched daemon FAULT on 2026-10-12).
+     robot._state_lock.acquire()
+     try:
+         start = time.perf_counter()
+-        with pytest.raises(TimeoutError):
+-            robot.get_joint_sample()
+-        assert time.perf_counter() - start < 0.5
++        held = robot.get_joint_sample()
++        assert time.perf_counter() - start < 0.005
++        np.testing.assert_array_equal(held["received_monotonic_s"], fresh["received_monotonic_s"])
+     finally:
+         robot._state_lock.release()
+ 

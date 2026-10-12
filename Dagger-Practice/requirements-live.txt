@@ -1,0 +1,13 @@
+# Python 3.12, isolated runtime/preflight environment. No torch or JAX.
+# Importing these packages does not validate attached hardware or its drivers.
+-r ../dagger_offline/requirements.txt
+dynamixel-sdk==4.1.0
+pyserial==3.5
+msgpack-numpy==0.4.8
+pydantic==2.14.0
+pyrealsense2==2.58.4.10922
+# Imported by the isolated i2rt protocol regression tests (no bus opened).
+python-can==4.6.1
+crcmod==1.7
+dm-env==1.6
+omegaconf==2.3.1

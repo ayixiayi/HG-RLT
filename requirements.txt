@@ -1,0 +1,11 @@
+# OpenPI's pinned LeRobot writer produces dataset format v2.1, NOT latest v3.
+lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
+mcap==1.4.0
+numpy==1.26.4
+datasets==3.6.0
+huggingface-hub==0.35.3
+torch==2.7.1
+torchvision==0.22.1
+torchcodec==0.3.0
+av==15.1.0
+opencv-python-headless==4.11.0.86
