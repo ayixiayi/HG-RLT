@@ -348,12 +348,19 @@ def test_official_relative_stationary_anchor_continuous_gripper_and_ack_seed(
     relative.anchor(leader, follower)
     for _ in range(3):
         np.testing.assert_allclose(relative.step(leader), follower, atol=2e-3)
-    moved = {side: value.copy() for side, value in leader.items()}
-    for value in moved.values():
-        value[6] += 0.11
-    result = relative.step(moved)
-    np.testing.assert_allclose(result[[6, 13]], follower[[6, 13]] + 0.11, atol=1e-6)
-    assert np.all(result[[6, 13]] < 1)  # official base implementation snaps open
+    # Gripper pickup: the follower holds (0.35 / 0.6) until each trigger
+    # reaches it, then tracks the trigger absolutely in both directions.
+    def grippers(left, right):
+        moved = {side: value.copy() for side, value in leader.items()}
+        moved["left"][6], moved["right"][6] = left, right
+        return relative.step(moved)[[6, 13]]
+
+    np.testing.assert_allclose(grippers(0.1, 0.2), [0.35, 0.6], atol=1e-6)
+    np.testing.assert_allclose(grippers(0.31, 0.58), [0.31, 0.58], atol=1e-6)
+    np.testing.assert_allclose(grippers(0.9, 0.62), [0.9, 0.62], atol=1e-6)
+    np.testing.assert_allclose(grippers(0.0, 1.0), [0.0, 1.0], atol=1e-6)
+    relative.anchor(leader, follower)
+    np.testing.assert_allclose(grippers(0.5, 0.2), [0.5, 0.6], atol=1e-6)  # crossed
     acknowledged = follower.copy()
     acknowledged[ARMS] += 0.001
     control = Controller(relative, SimpleNamespace(), now=0)

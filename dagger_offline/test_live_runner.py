@@ -332,7 +332,7 @@ class Followers:
 
 @pytest.mark.parametrize("cancel", [False, True])
 def test_trigger_gesture_takes_over_and_leaders_follow_outside_human(tmp_path, cancel):
-    keys = {0: ["p"], 40: ["h"], 70: ["p"], 100: ["k"]}
+    keys = {0: ["p"], 40: ["h"], 90: ["p"], 120: ["k"]}
     if cancel:
         keys[45] = ["s"]
     h = Harness(tmp_path / "gesture.h5", keys)
@@ -341,38 +341,48 @@ def test_trigger_gesture_takes_over_and_leaders_follow_outside_human(tmp_path, c
     def hook(stage):
         if stage == "poll":
             tick = h.clock.tick
-            # Both triggers squeezed (not simultaneously), then both released.
-            h.leader_state["right"][6] = 0.9 if 50 <= tick < 55 else 0.05
-            h.leader_state["left"][6] = 0.85 if 48 <= tick < 53 else 0.0
+            # Both squeezed from tick 50 (left first) and held.
+            h.leader_state["right"][6] = 0.9 if 50 <= tick < 85 else 0.05
+            h.leader_state["left"][6] = 0.85 if 48 <= tick < 85 else 0.0
 
     h.hook = hook
     h.run()
     human = [t for t, owner, _ in h.sent if owner is Ownership.HUMAN]
-    assert not [t for t in human if t < 55]  # h alone only stops the robot
-    assert not any(40 < t <= 55 for t, _, _ in h.sent)  # HOLD while armed
     if cancel:
         assert not human
+        assert not any(40 < t < 90 for t, _, _ in h.sent)
     else:
-        assert human and min(human) >= 55 and max(human) < 70
-        released = min(t for t, kind, _ in h.leaders.calls if kind == "passive")
-        assert 54 <= released <= 56
+        took = min(t for t, kind, _ in h.leaders.calls if kind == "passive")
+        assert not any(40 < t < took for t, _, _ in h.sent)  # HOLD while armed
+        assert 50 + 14 <= took <= 50 + 17  # 0.5 s hold at 30 Hz
+        assert human and min(human) >= took and max(human) < 90
         assert all(
-            kind == "passive" for t, kind, _ in h.leaders.calls if released <= t < 70
+            kind == "passive" for t, kind, _ in h.leaders.calls if took <= t < 90
         )
-    follows = [(t, q) for t, kind, q in h.leaders.calls if kind == "follow"]
-    assert follows and all(t < 55 or t >= 70 for t, _ in follows) or cancel
+        follows = [t for t, kind, _ in h.leaders.calls if kind == "follow"]
+        assert follows and all(t < took or t >= 90 for t in follows)
     with h5py.File(h.path) as f:
         reasons = f["dagger_events/reason"].asstr()[:]
         assert "takeover armed" in reasons
 
 
-def test_one_trigger_alone_never_takes_over(tmp_path):
-    h = Harness(tmp_path / "one-trigger.h5", {0: ["p"], 40: ["h"], 100: ["k"]})
+@pytest.mark.parametrize(
+    "right",
+    [
+        lambda t: 50 <= t < 58,  # both squeezed, released before 0.5 s
+        lambda t: 50 <= t < 60 or 62 <= t < 72,  # held twice, gap resets
+        lambda t: False,  # one trigger alone
+    ],
+)
+def test_short_or_one_sided_squeeze_never_takes_over(tmp_path, right):
+    h = Harness(tmp_path / "short.h5", {0: ["p"], 40: ["h"], 100: ["k"]})
     h.leaders = Followers(h)
 
     def hook(stage):
         if stage == "poll":
-            h.leader_state["right"][6] = 0.9 if 50 <= h.clock.tick < 55 else 0.05
+            tick = h.clock.tick
+            h.leader_state["left"][6] = 0.9 if 50 <= tick < 95 else 0.05
+            h.leader_state["right"][6] = 0.9 if right(tick) else 0.05
 
     h.hook = hook
     h.run()
@@ -381,21 +391,23 @@ def test_one_trigger_alone_never_takes_over(tmp_path):
 
 
 def test_on_demand_leaders_only_align_while_takeover_is_armed(tmp_path):
-    h = Harness(tmp_path / "on-demand.h5", {0: ["p"], 40: ["h"], 70: ["p"], 100: ["k"]})
+    h = Harness(
+        tmp_path / "on-demand.h5", {0: ["p"], 40: ["h"], 90: ["p"], 120: ["k"]}
+    )
     h.leaders = Followers(h, continuous=False)
 
     def hook(stage):
         if stage == "poll":
             tick = h.clock.tick
-            h.leader_state["left"][6] = 0.9 if 50 <= tick < 55 else 0.05
-            h.leader_state["right"][6] = 0.9 if 50 <= tick < 55 else 0.1
+            h.leader_state["left"][6] = 0.9 if 50 <= tick < 80 else 0.05
+            h.leader_state["right"][6] = 0.9 if 50 <= tick < 80 else 0.1
 
     h.hook = hook
     h.run()
     follows = [t for t, kind, _ in h.leaders.calls if kind == "follow"]
-    assert follows and min(follows) >= 40 and max(follows) < 56
+    assert follows and min(follows) >= 40 and max(follows) < 68
     assert any(owner is Ownership.HUMAN for _, owner, _ in h.sent)
-    assert any(owner is Ownership.POLICY and t > 70 for t, owner, _ in h.sent)
+    assert any(owner is Ownership.POLICY and t > 90 for t, owner, _ in h.sent)
 
 
 @pytest.mark.parametrize("stage", ["capture", "plan", "activate"])

@@ -37,13 +37,36 @@ class TrackingStalled(PolicyTargetRejected):
 JOINT_NAMES = [f"{s}{i}" for s in "LR" for i in (*range(1, 7), "g")]
 
 
+GRIPPER_PICKUP = 0.05  # trigger within this of the follower gripper engages it
+
+
 def relative_controller(qpos):
     from deploy.robot.gym.dagger_rollout import RelativeGelloController
 
     class ContinuousGripper(RelativeGelloController):
-        # Preserve the anchor offset but do not inherit ABC's sudden open snap.
+        # Pickup instead of ABC's anchor offset and open snap: the follower
+        # gripper holds until the trigger reaches it, then tracks absolutely,
+        # so the full open/close range stays available after any handover.
+        def anchor(self, gello, follower):
+            super().anchor(gello, follower)
+            self._pickup = {}
+            for side in ("left", "right"):
+                hold = float(np.clip(self.last[self._slice(side)][6], 0, 1))
+                trigger = float(np.clip(gello[side][6], 0, 1))
+                self._pickup[side] = (
+                    None if abs(trigger - hold) <= GRIPPER_PICKUP
+                    else (hold, np.sign(trigger - hold))
+                )
+
         def _gripper(self, side, value):
-            return float(np.clip(value + self._gripper_offset[side], 0, 1))
+            value = float(np.clip(value, 0, 1))
+            pending = getattr(self, "_pickup", {}).get(side)
+            if pending is not None:
+                hold, sign = pending
+                if abs(value - hold) > GRIPPER_PICKUP and np.sign(value - hold) == sign:
+                    return hold
+                self._pickup[side] = None
+            return value
 
     config = SimpleNamespace(
         robots={
@@ -82,7 +105,7 @@ LEADER_MODELS = {
 LEADER_MODE = 5  # current-based position: position goal with a current ceiling
 LEADER_FOLLOW_CURRENT_MA = 1200  # capped by each servo's Current Limit register
 LEADER_TRIGGER_SQUEEZE = 0.5  # normalized trigger travel that counts as squeezed
-LEADER_TRIGGER_RELEASE = 0.15  # back within this of the armed baseline = released
+LEADER_TRIGGER_HOLD = 0.5  # s both triggers stay squeezed to take over
 # Twice the follower's speed so a lagging leader catches up (unit 0.229 rpm).
 LEADER_PROFILE_VELOCITY = round(2 * HUMAN_ARM_VELOCITY * 60 / (2 * np.pi) / 0.229)
 ADDR_OPERATING_MODE, ADDR_CURRENT_LIMIT = 11, 38

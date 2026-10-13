@@ -32,7 +32,7 @@ def show_mode(state, *, waiting_for_policy=False):
 def show_controls():
     message("操作", "按键直接生效，无需回车；启动后保持，不会自动运动")
     print(
-        "  h  人工接管（主臂跟随时：先 HOLD，两个扳机都扣到底再松开才接管）\n"
+        "  h  人工接管（主臂跟随时：先 HOLD，两个扳机同时扣住 0.5 秒才接管）\n"
         "  p  交还策略      r  交给 RL actor（--rlt 时）      s  停止 / HOLD\n"
         "  c  标记检查点    x  丢弃检查点后的片段并保持\n"
         "  k  结束本条并标结果    q  整条弃用    ?  查看按键\n"
