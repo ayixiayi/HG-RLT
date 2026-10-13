@@ -104,7 +104,9 @@ LEADER_MODELS = {
 }
 LEADER_MODE = 5  # current-based position: position goal with a current ceiling
 LEADER_FOLLOW_CURRENT_MA = 1200  # capped by each servo's Current Limit register
-LEADER_TRIGGER_SQUEEZE = 0.5  # normalized trigger travel that counts as squeezed
+# Calibrated trigger, same scale as the follower gripper: 1 open .. 0 closed.
+LEADER_TRIGGER_RELEASED = 0.7  # at or above: released (must be seen after h)
+LEADER_TRIGGER_SQUEEZED = 0.3  # at or below, after a release: squeezed
 LEADER_TRIGGER_HOLD = 0.5  # s both triggers stay squeezed to take over
 # Twice the follower's speed so a lagging leader catches up (unit 0.229 rpm).
 LEADER_PROFILE_VELOCITY = round(2 * HUMAN_ARM_VELOCITY * 60 / (2 * np.pi) / 0.229)

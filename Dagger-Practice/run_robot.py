@@ -225,7 +225,7 @@ def preflight(args):
                 "policy_id": sealed["policy_id"],
                 "config": asdict(rl_config),
                 "config_digest": rl_config.digest(),
-                "rl_lead": 3,
+                "rl_lead": 0,
                 "max_deviation": 0.15,
             }
         )
@@ -304,7 +304,8 @@ def run_loop(
     from dagger_offline.arbitration import Ownership
     from dagger_offline.live_robot import (
         LEADER_TRIGGER_HOLD,
-        LEADER_TRIGGER_SQUEEZE,
+        LEADER_TRIGGER_RELEASED,
+        LEADER_TRIGGER_SQUEEZED,
         PolicyTargetRejected,
         TrackingStalled,
     )
@@ -320,7 +321,7 @@ def run_loop(
     last_cameras = last_leaders = None
     last_follower = None
     pending_keys = []
-    armed = None  # trigger baselines while a takeover gesture is pending
+    armed = None  # per side: trigger seen released since h (gesture pending)
     squeezed_since = None  # both triggers squeezed continuously since
 
     def ns(value=None):
@@ -330,7 +331,15 @@ def run_loop(
         nonlocal last_owner
         if force or control.owner is not last_owner:
             recorder.event(ns(), labels[control.owner], reason)
-            if control.owner is not last_owner or reason == "ownership selected":
+            # Synchronous RL chunks HOLD briefly between chunks: record, not show.
+            between_rl_chunks = (
+                reason == "controller transition"
+                and control.autonomous
+                and getattr(control, "rl_active", False)
+            )
+            if (
+                control.owner is not last_owner and not between_rl_chunks
+            ) or reason == "ownership selected":
                 show_mode(labels[control.owner], waiting_for_policy=control.autonomous)
             last_owner = control.owner
 
@@ -483,12 +492,12 @@ def run_loop(
                     # Stop now; ownership moves only on the trigger gesture.
                     control.control("s", now=now, qpos=snap.qpos)
                     sender.reanchor(snap.qpos)
-                    armed = {side: float(snap.leader[side][6]) for side in snap.leader}
+                    armed = {side: False for side in snap.leader}
                     squeezed_since = None
                     event("takeover armed", force=True)
                     message(
                         "接管准备",
-                        f"已保持。双手握住两只主臂，两个扳机同时扣住 {LEADER_TRIGGER_HOLD:g} 秒即接管；s / p 取消",
+                        f"已保持。双手握住两只主臂，两个扳机从松开位置同时扣住 {LEADER_TRIGGER_HOLD:g} 秒即接管；s / p 取消",
                         level="warning",
                     )
                 elif not repeated:
@@ -513,11 +522,16 @@ def run_loop(
             if armed is not None and not any(k in keys for k in ("s", "p", "x")):
                 # Both triggers: an unheld leader would sag and command the
                 # follower toward a pose it cannot reach (leader/follower DoF).
-                travel = {
-                    side: abs(float(snap.leader[side][6]) - baseline)
-                    for side, baseline in armed.items()
-                }
-                if all(t >= LEADER_TRIGGER_SQUEEZE for t in travel.values()):
+                trigger = {side: float(snap.leader[side][6]) for side in armed}
+                # A squeeze counts only after that trigger was seen released,
+                # so a trigger already squeezed (or left closed) at h cannot
+                # start the hold, and releasing never reads as squeezing.
+                for side, value in trigger.items():
+                    armed[side] = armed[side] or value >= LEADER_TRIGGER_RELEASED
+                if all(
+                    armed[side] and value <= LEADER_TRIGGER_SQUEEZED
+                    for side, value in trigger.items()
+                ):
                     squeezed_since = now if squeezed_since is None else squeezed_since
                 else:
                     squeezed_since = None
@@ -889,7 +903,7 @@ def execute(args, config, profile, camera_config, reference, metadata):
             now=time.monotonic(),
             replan_lead=metadata["policy_execution"]["replan_lead"],
             rl=agent,
-            rl_lead=metadata.get("rlt", {}).get("rl_lead", 3),
+            rl_lead=metadata.get("rlt", {}).get("rl_lead", 0),
         )
         lease = TickLease(safety, uuid.uuid4().hex)
         sender = GuardedSender(robot, limits, initial, session_id=lease.session_id)

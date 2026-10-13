@@ -2,12 +2,17 @@
 
 Replay (one shard per labelled episode, built only after its outcome is saved):
 
-* one transition per RL actor decision; ``action`` is what the robot actually
-  received (daemon ACK targets) for the k steps until the next decision, with
-  the actor's remaining unexecuted steps filling the rest of the chunk;
-  ``discount`` = gamma**k;
-* decisions of one uninterrupted RL run chain into each other (done=0);
-* the last decision of a run is terminal: reward 1 if the episode succeeded
+* RL chunks are synchronous: the next decision observes only after this
+  chunk finished (recordings with prefetched RL chunks are refused);
+* one transition per RL actor decision that executed; ``action`` is what the
+  robot actually received (daemon ACK targets) until the next decision was
+  accepted, with the actor's remaining unexecuted steps filling the rest of
+  the chunk; ``discount`` = gamma**k for the k control steps between the two
+  observations;
+* executed decisions of one uninterrupted RL run chain into each other
+  (done=0); a decision that executed nothing (e.g. ``k`` right after it) is
+  skipped;
+* the last executed decision of a run is terminal: reward 1 if the episode succeeded
   and no human took over after this run (handing back to the VLA with ``p`` or
   pausing with ``s`` keeps the credit), otherwise 0. The value is the
   probability of finishing without human help once the actor hands off.
@@ -86,40 +91,55 @@ def chain_transitions(episode, decisions, config):
     row_ns = episode.get("row_ns")
     d = decisions
     count = len(d["accepted_ns"])
-    rows = []
+    never = 2**63
+    # Pass 1: the commands each decision actually executed. A decision's chunk
+    # runs from its acceptance until the next decision is accepted (or the run
+    # ends); RL decisions are synchronous (no prefetch), so the next state is
+    # observed only after this chunk finished.
+    spans = []
     for i in range(count):
-        observed = int(d["observed_ns"][i])
-        start = int(d["accepted_ns"][i])
-        # The transition ends where the next decision's state was observed:
-        # commands sent after that belong to the next state's dynamics.
-        stop = int(d["observed_ns"][i + 1]) if i + 1 < count else None
+        observed, start = int(d["observed_ns"][i]), int(d["accepted_ns"][i])
         cut = boundaries[boundaries > observed]
-        run_end = int(cut[0]) if len(cut) else None
-        limits = [x for x in (stop, run_end) if x is not None]
-        end = min(limits) if limits else None
-        if any(
-            a < (end if end is not None else 2**63) and b > observed
-            for a, b in discards
-        ):
-            continue  # touches an operator-discarded interval
-        window = (sent >= start) & valid & (sent > 0)
-        if end is not None:
-            window &= sent < end
-        ran = commands[window]
-        if len(ran) == 0:
+        run_end = int(cut[0]) if len(cut) else never
+        following = int(d["accepted_ns"][i + 1]) if i + 1 < count else never
+        end = min(following, run_end)
+        if any(a < end and b > observed for a, b in discards):
+            spans.append(None)  # touches an operator-discarded interval
             continue
-        if row_ns is not None and end is not None:
-            elapsed = int(np.sum((row_ns >= observed) & (row_ns < end)))
+        window = (sent >= start) & valid & (sent > 0) & (sent < end)
+        if i + 1 < count and int(d["observed_ns"][i + 1]) < run_end:
+            late = window & (sent >= int(d["observed_ns"][i + 1]))
+            if np.any(late):
+                raise ValueError(
+                    "RL decision executed after the next state was observed "
+                    "(prefetched RL chunks); this replay needs rl_lead=0"
+                )
+        spans.append({"run_end": run_end, "end": end, "window": window})
+    # Pass 2: chain decisions that executed; a run's last executed decision is
+    # terminal and carries the episode result.
+    executed = [i for i, span in enumerate(spans) if span and span["window"].any()]
+    rows = []
+    for n, i in enumerate(executed):
+        span = spans[i]
+        observed, start = int(d["observed_ns"][i]), int(d["accepted_ns"][i])
+        run_end = span["run_end"]
+        j = executed[n + 1] if n + 1 < len(executed) else None
+        chained = (
+            j is not None
+            and int(d["observed_ns"][j]) < run_end
+            and all(spans[m] is not None for m in range(i + 1, j))
+        )
+        ran = commands[span["window"]]
+        stop = int(d["observed_ns"][j]) if chained else min(span["end"], run_end)
+        if row_ns is not None and stop < never:
+            elapsed = int(np.sum((row_ns >= observed) & (row_ns < stop)))
         else:
             elapsed = len(ran)
-        executed = ran[: config.chunk]
+        executed_steps = ran[: config.chunk]
         qpos = d["proprio"][i][: rlt.JOINTS]
         planned = np.array(d["planned"][i], dtype=np.float64)
-        planned[: len(executed)] = executed
-        chained = stop is not None and (run_end is None or stop < run_end)
-        discarded_next = run_end is not None and run_end in set(discard_starts.tolist())
+        planned[: len(executed_steps)] = executed_steps
         if chained:
-            j = i + 1
             next_ref = rlt.to_residual(
                 d["reference"][j], d["proprio"][j][: rlt.JOINTS], config
             )
@@ -127,6 +147,7 @@ def chain_transitions(episode, decisions, config):
             reward, done = 0.0, 0.0
         else:
             helped = bool(np.any(takeovers >= start))
+            discarded_next = run_end in set(discard_starts.tolist())
             next_ref = np.zeros(config.action_dim, np.float32)
             next_token = np.zeros_like(d["token"][i])
             next_proprio = np.zeros(rlt.PROPRIO, np.float32)
@@ -213,6 +234,17 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
             "RLT learner",
             f"恢复训练状态：actor v{version} · 已训练 {len(processed)} 个分片",
         )
+        # The state is saved before each publication; an interruption between
+        # the two leaves the actor missing or behind: publish it from the state.
+        published = None
+        if (actor_dir / "actor.npz").exists():
+            _, published = rlt.load_actor(actor_dir, config)
+        if version and published != version:
+            if published is not None and published > version:
+                version = published + 1  # never step a watched version back
+                learner.save_state(state_path, version=version, processed=processed)
+            rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
+            message("RLT learner", f"按训练状态补发 actor v{version}", level="warning")
     elif (actor_dir / "actor.npz").exists():
         raise RuntimeError(
             f"{actor_dir} 已有 actor 但缺少训练状态 {state_path}；拒绝覆盖。换新的 --run 目录重新开始"
@@ -239,9 +271,10 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
                     added += len(shard["token"])
             log = learner.train(replay, steps=added)
             version += 1
-            rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
             processed |= set(fresh)
+            # State first: a restart can always re-publish this actor from it.
             learner.save_state(state_path, version=version, processed=processed)
+            rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
             message(
                 "RLT learner",
                 f"actor v{version} 已发布 · replay {size} · 新增 {added} · "

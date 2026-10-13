@@ -341,9 +341,10 @@ def test_trigger_gesture_takes_over_and_leaders_follow_outside_human(tmp_path, c
     def hook(stage):
         if stage == "poll":
             tick = h.clock.tick
-            # Both squeezed from tick 50 (left first) and held.
-            h.leader_state["right"][6] = 0.9 if 50 <= tick < 85 else 0.05
-            h.leader_state["left"][6] = 0.85 if 48 <= tick < 85 else 0.0
+            # Calibrated trigger: 1 released .. 0 squeezed. Both squeezed from
+            # tick 50 (left first) and held.
+            h.leader_state["right"][6] = 0.1 if 50 <= tick < 85 else 0.95
+            h.leader_state["left"][6] = 0.15 if 48 <= tick < 85 else 1.0
 
     h.hook = hook
     h.run()
@@ -381,13 +382,34 @@ def test_short_or_one_sided_squeeze_never_takes_over(tmp_path, right):
     def hook(stage):
         if stage == "poll":
             tick = h.clock.tick
-            h.leader_state["left"][6] = 0.9 if 50 <= tick < 95 else 0.05
-            h.leader_state["right"][6] = 0.9 if right(tick) else 0.05
+            h.leader_state["left"][6] = 0.1 if 50 <= tick < 95 else 0.95
+            h.leader_state["right"][6] = 0.1 if right(tick) else 0.95
 
     h.hook = hook
     h.run()
     assert not any(owner is Ownership.HUMAN for _, owner, _ in h.sent)
     assert not any(t > 40 for t, _, _ in h.sent)
+
+
+def test_releasing_triggers_squeezed_at_h_never_takes_over(tmp_path):
+    keys = {0: ["p"], 40: ["h"], 160: ["p"], 190: ["k"]}
+    h = Harness(tmp_path / "release.h5", keys)
+    h.leaders = Followers(h)
+
+    def hook(stage):
+        if stage == "poll":
+            tick = h.clock.tick
+            # Squeezed before and at h, released and held open well past
+            # 0.5 s; only the later squeeze from released counts.
+            squeezed = tick < 60 or 110 <= tick < 150
+            for side in ("left", "right"):
+                h.leader_state[side][6] = 0.1 if squeezed else 0.95
+
+    h.hook = hook
+    h.run()
+    human = [t for t, owner, _ in h.sent if owner is Ownership.HUMAN]
+    assert human and min(human) >= 110 + 14
+    assert not any(40 < t < 110 + 14 for t, _, _ in h.sent)
 
 
 def test_on_demand_leaders_only_align_while_takeover_is_armed(tmp_path):
@@ -399,8 +421,8 @@ def test_on_demand_leaders_only_align_while_takeover_is_armed(tmp_path):
     def hook(stage):
         if stage == "poll":
             tick = h.clock.tick
-            h.leader_state["left"][6] = 0.9 if 50 <= tick < 80 else 0.05
-            h.leader_state["right"][6] = 0.9 if 50 <= tick < 80 else 0.1
+            h.leader_state["left"][6] = 0.1 if 50 <= tick < 80 else 0.95
+            h.leader_state["right"][6] = 0.1 if 50 <= tick < 80 else 0.9
 
     h.hook = hook
     h.run()
@@ -2086,7 +2108,7 @@ def test_rlt_episode_replay_learner_and_hot_reload(tmp_path):
         h.worker = TokenWorker(h)
         agent = rlt.RLAgent(config, run / "actor", max_deviation=0.15)
         h.control = Controller(
-            h.relative, h.worker, now=h.clock.monotonic(), rl=agent, rl_lead=3
+            h.relative, h.worker, now=h.clock.monotonic(), rl=agent
         )
         h.run(
             review=lambda: "success",
@@ -2110,6 +2132,17 @@ def test_rlt_episode_replay_learner_and_hot_reload(tmp_path):
         assert np.all(
             np.abs(d["actor"][:] - d["reference"][:])[..., [0, 1, 2]] <= 0.15 + 1e-9
         )
+        # Synchronous chunks: nothing runs between a state and its decision.
+        observed = d["observed_ns"][:].astype(np.int64)
+        accepted = d["accepted_ns"][:].astype(np.int64)
+        sent = f["pairing/command_sent_ns"][:]
+        valid = f["pairing/action_valid"][:].astype(bool)
+        for o, a in zip(observed[1:], accepted[1:], strict=True):
+            assert not np.any(valid & (sent >= o) & (sent < a))
+        # Every chunk but the last ran completely before the next observation.
+        for i in range(count - 1):
+            ran = valid & (sent >= accepted[i]) & (sent < accepted[i + 1])
+            assert ran.sum() == config.chunk
     rows = rlt_learn.episode_transitions(h.path, config)
     assert rows and len(rows) <= count
     assert [r["done"] for r in rows[:-1]] == [0.0] * (len(rows) - 1)
@@ -2153,7 +2186,7 @@ def test_r_without_rlt_is_ignored_and_rl_needs_token(tmp_path):
         h.run()
 
 
-def _rl_harness(path, keys, run, config):
+def _rl_harness(path, keys, run, config, rl_lead=0):
     from dagger_offline import rlt
     from dagger_offline.live_control import Controller
 
@@ -2165,7 +2198,7 @@ def _rl_harness(path, keys, run, config):
         h.worker,
         now=h.clock.monotonic(),
         rl=rlt.RLAgent(config, run / "actor"),
-        rl_lead=3,
+        rl_lead=rl_lead,
     )
     return h
 
@@ -2234,9 +2267,41 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
         h.run(review=lambda: "success", metadata={"collection": {"group": str(i)}})
         version = rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
         assert version == i  # the restarted learner continues the version
+    # Interrupted between saving the state and publishing the actor: the
+    # restart publishes the actor from the saved state.
+    h = _rl_harness(
+        recordings / "episodes/episode-000003.h5", {0: ["r"], 90: ["k"]}, run, config
+    )
+    h.run(review=lambda: "success", metadata={"collection": {"group": "3"}})
+    publish = rlt.publish_actor
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    rlt.publish_actor = interrupted
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
+    finally:
+        rlt.publish_actor = publish
+    assert rlt.load_actor(run / "actor", config)[1] == 2
+    assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 3
+    assert rlt.load_actor(run / "actor", config)[1] == 3
     state = (run / "learner.pkl").read_bytes()
     (run / "learner.pkl").unlink()
     with pytest.raises(RuntimeError, match="拒绝覆盖"):
         rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
     (run / "learner.pkl").write_bytes(state)
-    assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 2
+    assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 3
+
+
+def test_prefetched_rl_recording_is_refused_by_the_replay(tmp_path):
+    pytest.importorskip("jax")
+    from dagger_offline import rlt, rlt_learn
+
+    config = rlt.RLTConfig(token_dim=8, hidden=32, batch=32)
+    path = tmp_path / "rec/episodes/episode-000001.h5"
+    h = _rl_harness(path, {0: ["r"], 90: ["k"]}, tmp_path / "run", config, rl_lead=3)
+    h.run(review=lambda: "success", metadata={"collection": {"group": "g"}})
+    with pytest.raises(ValueError, match="rl_lead=0"):
+        rlt_learn.episode_transitions(path, config)

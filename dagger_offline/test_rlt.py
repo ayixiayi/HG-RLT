@@ -113,13 +113,23 @@ def test_td3_learner_improves_on_the_reference(reward_scale):
     assert learned < 0.5 * reference
 
 
-def _episode(**extra):
+def _episode(idle_last=False, **extra):
+    """Synchronous RL timeline: every chunk runs its SMALL.chunk commands from
+    its acceptance and finishes before the next state is observed."""
     rows = np.arange(100)
+    observed = np.array([100, 300, 500, 700] + ([900] if idle_last else []))
+    # Uneven reply latency: decision 1 is accepted 90 ns after its image.
+    accepted = observed + np.array([30, 90, 30, 30] + ([30] if idle_last else []))
+    sent = rows * 10 + 5
+    executing = accepted[:4]  # an idle last decision is ended (k) before acting
+    valid = np.zeros(100, bool)
+    for a in executing:
+        valid |= (sent >= a) & (sent < a + 10 * SMALL.chunk)
     episode = {
         "attrs": {"outcome": "success"},
         "row_ns": rows * 10,
-        "sent": rows * 10 + 5,
-        "valid": np.ones(100, bool),
+        "sent": sent,
+        "valid": valid,
         "commands": np.tile(np.linspace(-0.1, 0.1, 14), (100, 1)),
         "event_ns": np.array([950]),
         "event_reason": np.array(["finish"]),
@@ -127,28 +137,50 @@ def _episode(**extra):
         "discards": [],
     }
     episode.update(extra)
-    observed = np.array([100, 300, 500, 700])
+    n = len(observed)
     decisions = {
         "observed_ns": observed,
-        # Uneven reply latency: decision 1 is accepted 90 ns after its image.
-        "accepted_ns": observed + np.array([30, 90, 30, 30]),
-        "token": np.zeros((4, SMALL.token_dim), np.float32),
-        "proprio": np.zeros((4, rlt.PROPRIO), np.float32),
-        "reference": np.zeros((4, SMALL.chunk, 14)),
-        "planned": np.zeros((4, SMALL.chunk, 14)),
+        "accepted_ns": accepted,
+        "token": np.zeros((n, SMALL.token_dim), np.float32),
+        "proprio": np.zeros((n, rlt.PROPRIO), np.float32),
+        "reference": np.zeros((n, SMALL.chunk, 14)),
+        "planned": np.zeros((n, SMALL.chunk, 14)),
     }
     return episode, decisions
 
 
-def test_transition_ends_at_the_next_observation_and_discounts_elapsed_steps():
+def test_transition_covers_its_chunk_and_discounts_elapsed_steps():
     from dagger_offline import rlt_learn
 
     rows = rlt_learn.chain_transitions(*_episode(), SMALL)
     assert [r["done"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
     assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
-    # Decision 0 observed at 100, next state observed at 300: 20 rows elapse
-    # (counting to the next acceptance at 390 would give 26).
+    # Decision 0 observed at 100, next state observed at 300: 20 rows elapse.
     assert rows[0]["discount"] == pytest.approx(SMALL.gamma**20)
+
+
+def test_prefetched_rl_chunks_are_refused():
+    from dagger_offline import rlt_learn
+
+    episode, decisions = _episode()
+    # Decision 0 still acting after decision 1 observed (300) but before it
+    # was accepted (390): next state and executed actions disagree.
+    episode["valid"][30] = True
+    with pytest.raises(ValueError, match="rl_lead=0"):
+        rlt_learn.chain_transitions(episode, decisions, SMALL)
+
+
+def test_a_decision_ended_before_acting_leaves_the_result_on_the_previous():
+    from dagger_offline import rlt_learn
+
+    rows = rlt_learn.chain_transitions(*_episode(idle_last=True), SMALL)
+    assert len(rows) == 4
+    assert [(r["done"], r["reward"]) for r in rows] == [
+        (0.0, 0.0),
+        (0.0, 0.0),
+        (0.0, 0.0),
+        (1.0, 1.0),
+    ]
 
 
 def test_discarded_interval_breaks_the_chain_and_removes_its_credit():

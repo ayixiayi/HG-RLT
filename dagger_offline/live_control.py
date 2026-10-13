@@ -87,7 +87,7 @@ class Controller:
         timeout=0.2,
         replan_lead=8,
         rl=None,
-        rl_lead=3,
+        rl_lead=0,
     ):
         if not isinstance(horizon, int) or not 1 <= horizon <= 30:
             raise ValueError("execution horizon must be 1..30")
@@ -107,8 +107,10 @@ class Controller:
         self._accepted = []
         # RLT: `rl` decides an actor chunk from (token, proprio, reference).
         self.rl, self.rl_active = rl, False
-        if rl is not None and not 0 < rl_lead < rl.chunk:
-            raise ValueError("rl_lead must be inside the RL chunk")
+        # 0: RL chunks are synchronous (observe after the chunk finished), the
+        # timing the replay assumes; >0 prefetches like the VLA.
+        if rl is not None and not 0 <= rl_lead < rl.chunk:
+            raise ValueError("rl_lead must be 0 .. RL chunk-1")
         self.rl_lead = rl_lead
         self._decisions = []
         self._qpos = self._previous_qpos = None
