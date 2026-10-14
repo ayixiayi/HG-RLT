@@ -92,7 +92,7 @@ YAM 没有物理急停，现场操作者须能随时断电。
 
 ### 2.4 主臂与接管
 
-主臂关节和扳机舵机（扳机已拆弹簧）在启动时切换为电流位置模式（模式 5，限流 1200 mA，受各舵机 Current Limit 封顶）；跟随时扳机对齐机械臂的夹爪开度。
+主臂关节和扳机舵机（扳机已拆弹簧）在启动时切换为电流位置模式（模式 5，关节限流 1200 mA、扳机 300 mA，受各舵机 Current Limit 封顶）；跟随时扳机对齐机械臂的夹爪开度，目标留在校准范围两端以内 0.05，不顶死限位。
 
 | 模式 | 策略执行 / HOLD 时主臂 | 按 `h` 后 |
 | --- | --- | --- |
@@ -475,7 +475,8 @@ printf '粘贴模型完整 OSS 地址：'; IFS= read -r MODEL_SOURCE
 | `策略拒绝：… prediction jump …` | 相邻预测跳变超过 0.30 rad，未发送；已 HOLD，`h` / `p` 恢复 |
 | `主臂串口断开或已重连（USB 断开？）` | 主臂 USB 复位，常见于集线器；本条中止，改直连主机 USB 或用 `collect-compat` |
 | `主臂 … 扭矩未能关闭，请给主臂断电` | USB 复位后重开串口仍关不掉扭矩；给主臂断电 |
-| `A leader is stale` | 主臂采样超过 0.2 s 未更新；检查主臂串口和供电 |
+| `A leader is stale: 左/右主臂…` | 该主臂采样超过 0.2 s 未更新；检查它的 USB 线、集线器和供电 |
+| `Leader … failed (-1000)` | 主臂 USB 刚断开，串口处于忙状态；同上，并看 `/dev/serial/by-id/` 是否重新出现 |
 | `Leader servo … model … cannot follow` | 舵机型号不支持模式 5；加 `--passive-leaders` |
 | `set_pu(...) failed … Device or resource busy` | 相机还没从上一条释放；启动时自动重试 3 次（间隔 1 秒），仍失败时重新运行，持续出现时拔插相机 |
 | `Confirmed SAFE_HOLD required` / `fault` | 硬件进程不在 HOLD；托住双臂 `./hgrlt daemon-restart` |

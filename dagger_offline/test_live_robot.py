@@ -494,6 +494,7 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
         ADDR_TORQUE_ENABLE,
         LEADER_FOLLOW_CURRENT_MA,
         LEADER_MODE,
+        LEADER_TRIGGER_CURRENT_MA,
         Leader,
     )
 
@@ -510,6 +511,7 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
     assert regs[1][ADDR_GOAL_CURRENT] == LEADER_FOLLOW_CURRENT_MA
     assert regs[2][ADDR_GOAL_CURRENT] == round(LEADER_FOLLOW_CURRENT_MA / 2.69)
     assert regs[4][ADDR_GOAL_CURRENT] == 900
+    assert regs[7][ADDR_GOAL_CURRENT] == LEADER_TRIGGER_CURRENT_MA  # light trigger
     assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))
 
     target = np.array([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.9])
@@ -729,3 +731,27 @@ def test_healthy_close_releases_all_seven_without_port_recovery(monkeypatch):
     leader.close()  # no passive() first: the fallback itself must cover all 7
     assert not recovered
     assert all(packet.regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))
+
+
+def test_trigger_targets_stay_inside_its_span_and_dead_reader_names_usb(monkeypatch):
+    from dagger_offline.live_robot import (
+        ADDR_GOAL_POSITION,
+        LEADER_TRIGGER_MARGIN,
+        Leader,
+    )
+
+    packet = fake_leader_modules(monkeypatch, {i: 1200 for i in range(1, 8)})
+    leader = Leader(LEADER_CONFIG, actuated=True)
+    lo, hi = np.deg2rad(158.0), np.deg2rad(200.0)
+    for opening, expect in ((0.0, LEADER_TRIGGER_MARGIN), (1.0, 1 - LEADER_TRIGGER_MARGIN)):
+        leader.follow(np.array([0, 0, 0, 0, 0, 0, opening], dtype=float))
+        goal = lo + expect * (hi - lo)
+        assert packet.regs[7][ADDR_GOAL_POSITION] == round(goal * 2048 / np.pi)
+
+    class Dead:
+        def is_alive(self):
+            return False
+
+    leader.driver._reading_thread = Dead()
+    with pytest.raises(RuntimeError, match="USB 断开"):
+        leader.follow(np.zeros(7))

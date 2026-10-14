@@ -105,6 +105,10 @@ LEADER_MODELS = {
 }
 LEADER_MODE = 5  # current-based position: position goal with a current ceiling
 LEADER_FOLLOW_CURRENT_MA = 1200  # capped by each servo's Current Limit register
+# The springless trigger needs little force; a stalled trigger at full current
+# sags the leader supply until both USB adapters reset.
+LEADER_TRIGGER_CURRENT_MA = 300
+LEADER_TRIGGER_MARGIN = 0.05  # trigger targets stay this far inside its span
 # Takeover confirmation on the calibrated trigger (1 open .. 0 closed): with
 # the triggers unpowered, each is opened fully, then squeezed fully.
 LEADER_TRIGGER_OPEN = 0.8
@@ -251,7 +255,7 @@ class Leader:
         """
         changed_at = -np.inf
         currents = []
-        for dxl_id in self.arm.ids:
+        for index, dxl_id in enumerate(self.arm.ids):
             model = self.arm.model(dxl_id)
             if model not in LEADER_MODELS:
                 raise RuntimeError(
@@ -266,7 +270,8 @@ class Leader:
             # Goal Current unit: 1 mA (XL330/XC330), 2.69 mA (XM430).
             unit = 2.69 if LEADER_MODELS[model].startswith("XM430") else 1.0
             limit = self.arm.read(dxl_id, ADDR_CURRENT_LIMIT, 2)
-            currents.append(min(round(LEADER_FOLLOW_CURRENT_MA / unit), limit))
+            ceiling = LEADER_TRIGGER_CURRENT_MA if index == 6 else LEADER_FOLLOW_CURRENT_MA
+            currents.append(min(round(ceiling / unit), limit))
         count = len(self.arm.ids)
         self.arm.write(ADDR_GOAL_CURRENT, 2, currents)
         self.arm.write(ADDR_PROFILE_VELOCITY, 4, [LEADER_PROFILE_VELOCITY] * count)
@@ -283,6 +288,9 @@ class Leader:
         """
         if self.arm is None:
             return
+        # A dead reader means the adapter dropped: report that, not the
+        # write status (-1000 port busy) it leaves behind.
+        self.check_connection()
         target = np.asarray(qpos7, dtype=float)
         if target.shape != (7,) or not np.isfinite(target).all():
             raise ValueError("Leader follow target must be 7 finite values")
@@ -302,7 +310,9 @@ class Leader:
             self.trigger_following = False
         goals = list(target[:6] * self.signs[:6] + self.offsets[:6])
         if trigger:
-            opening = float(np.clip(target[6], 0, 1))
+            opening = float(
+                np.clip(target[6], LEADER_TRIGGER_MARGIN, 1 - LEADER_TRIGGER_MARGIN)
+            )
             goals.append(self.gripper[0] + opening * (self.gripper[1] - self.gripper[0]))
         self.arm.goal_positions(goals, self.arm.ids[: len(goals)])
 

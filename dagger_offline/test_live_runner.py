@@ -343,7 +343,7 @@ def _trigger_hook(h, script):
         tick = h.clock.tick
         for side, index in (("left", 6), ("right", 13)):
             if h.leaders.trigger:
-                h.leader_state[side][6] = h.qpos[index]
+                h.leader_state[side][6] = np.clip(h.qpos[index], 0.05, 0.95)
             else:
                 unpowered.append(tick)
                 value = script(tick, side)
@@ -400,6 +400,37 @@ def test_takeover_needs_both_triggers_opened_then_squeezed(tmp_path, fingers):
     h.run()
     assert not any(owner is Ownership.HUMAN for _, owner, _ in h.sent)
     assert not any(t > 40 for t, _, _ in h.sent)
+
+
+@pytest.mark.parametrize("unplugged", [False, True])
+def test_stale_leader_names_the_arm_or_its_usb_loss(tmp_path, unplugged):
+    h = Harness(tmp_path / "stale.h5", {0: ["p"], 60: ["k"]})
+    h.leaders = Followers(h)
+
+    class Arm:
+        def __init__(self, side):
+            self.side = side
+
+        def check_connection(self):
+            if unplugged and self.side == "right":
+                raise RuntimeError("主臂串口断开或已重连（USB 断开？）：/dev/right")
+
+    h.leaders.leaders = {side: Arm(side) for side in ("left", "right")}
+
+    def hook(stage):
+        if stage == "capture" and h.clock.tick == 5:
+            h.snapshot.leader_times["right"] -= 0.3
+
+    h.hook = hook
+    with pytest.raises((RuntimeError, BaseExceptionGroup)) as caught:
+        h.run()
+    text = str(caught.value) + "".join(
+        str(e) for e in getattr(caught.value, "exceptions", ())
+    )
+    if unplugged:
+        assert "USB 断开" in text and "/dev/right" in text
+    else:
+        assert "右主臂采样超过 0.2 秒未更新" in text
 
 
 def test_on_demand_leaders_only_align_while_takeover_is_armed(tmp_path):

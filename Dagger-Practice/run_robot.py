@@ -306,6 +306,7 @@ def run_loop(
     from dagger_offline.arbitration import Ownership
     from dagger_offline.live_robot import (
         LEADER_TRIGGER_CLOSED,
+        LEADER_TRIGGER_MARGIN,
         LEADER_TRIGGER_MATCH,
         LEADER_TRIGGER_OPEN,
         PolicyTargetRejected,
@@ -433,11 +434,22 @@ def run_loop(
                 snap.camera_times[k] <= last_cameras[k] for k in last_cameras
             ):
                 raise RuntimeError("Camera timestamp repeated/regressed")
-            if any(
-                not np.isfinite(t) or not 0 <= now - t <= 0.2
-                for t in snap.leader_times.values()
-            ):
-                raise RuntimeError("A leader is stale; takeover must remain available")
+            stale = [
+                side
+                for side, t in snap.leader_times.items()
+                if not np.isfinite(t) or not 0 <= now - t <= 0.2
+            ]
+            if stale:
+                # A dropped USB adapter shows up here first: name it.
+                for side in stale:
+                    arm = getattr(leaders, "leaders", {}).get(side)
+                    if arm is not None:
+                        arm.check_connection()
+                names = "、".join({"left": "左", "right": "右"}[s] for s in stale)
+                raise RuntimeError(
+                    f"A leader is stale: {names}主臂采样超过 0.2 秒未更新"
+                    "（检查该主臂的 USB 线、集线器和供电）；takeover must remain available"
+                )
             if last_leaders is not None and any(
                 snap.leader_times[k] < last_leaders[k] for k in last_leaders
             ):
@@ -530,7 +542,17 @@ def run_loop(
                 # squeezed fully (both hands on the leaders); the triggers
                 # then return powered to the robot gripper before handover.
                 trigger = {side: float(snap.leader[side][6]) for side in armed["opened"]}
-                gripper = {"left": float(snap.qpos[6]), "right": float(snap.qpos[13])}
+                # The re-powered trigger aims inside its span (see Leader.follow).
+                gripper = {
+                    side: float(
+                        np.clip(
+                            snap.qpos[index],
+                            LEADER_TRIGGER_MARGIN,
+                            1 - LEADER_TRIGGER_MARGIN,
+                        )
+                    )
+                    for side, index in (("left", 6), ("right", 13))
+                }
                 names = {"left": "左", "right": "右"}
                 if armed["phase"] == "confirm":
                     for side, value in trigger.items():
