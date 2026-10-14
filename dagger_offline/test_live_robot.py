@@ -499,12 +499,13 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
 
     models = {i: 1200 for i in range(1, 8)}
     models[2] = 1030  # an XM430 shoulder uses 2.69 mA current units
+    models[7] = 1190  # XL330-M077 trigger
     packet = fake_leader_modules(monkeypatch, models, {3: LEADER_MODE})
     packet.regs[4][38] = 900  # a lower Current Limit caps the goal current
     leader = Leader(LEADER_CONFIG, actuated=True)
     regs = packet.regs
-    assert all(regs[i][ADDR_OPERATING_MODE] == LEADER_MODE for i in range(1, 7))
-    assert regs[7][ADDR_OPERATING_MODE] == 3  # trigger servo untouched
+    # The springless trigger is actuated like the joints.
+    assert all(regs[i][ADDR_OPERATING_MODE] == LEADER_MODE for i in range(1, 8))
     assert (3, ADDR_OPERATING_MODE, LEADER_MODE) not in packet.writes
     assert regs[1][ADDR_GOAL_CURRENT] == LEADER_FOLLOW_CURRENT_MA
     assert regs[2][ADDR_GOAL_CURRENT] == round(LEADER_FOLLOW_CURRENT_MA / 2.69)
@@ -514,20 +515,24 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
     target = np.array([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.9])
     leader.follow(target)
     raw = target[:6] * leader.signs[:6] + leader.offsets[:6]
+    # Gripper opening 0.9 maps back onto the trigger's calibrated span; the
+    # sampled trigger value then reads the same 0.9.
+    trigger = np.deg2rad(158.0) + 0.9 * np.deg2rad(200.0 - 158.0)
     hold = round(np.pi * 2048 / np.pi)
     position_writes = [w for w in packet.writes if w[1] == ADDR_GOAL_POSITION]
     # First the present pose (no snap), then the follower target.
-    assert [v for i, _, v in position_writes[:6]] == [hold] * 6
-    assert [regs[i][ADDR_GOAL_POSITION] for i in range(1, 7)] == [
-        round(float(r) * 2048 / np.pi) & 0xFFFFFFFF for r in raw
+    assert [v for i, _, v in position_writes[:7]] == [hold] * 7
+    assert [regs[i][ADDR_GOAL_POSITION] for i in range(1, 8)] == [
+        round(float(r) * 2048 / np.pi) & 0xFFFFFFFF for r in [*raw, trigger]
     ]
-    assert all(regs[i][ADDR_TORQUE_ENABLE] == 1 for i in range(1, 7))
-    assert regs[7][ADDR_TORQUE_ENABLE] == 0 and ADDR_GOAL_POSITION not in regs[7]
+    leader.driver.raw[6] = trigger
+    assert leader.sample()[0][6] == pytest.approx(0.9)
+    assert all(regs[i][ADDR_TORQUE_ENABLE] == 1 for i in range(1, 8))
     leader.passive()
-    assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 7))
+    assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))
     leader.follow(target)
     leader.close()
-    assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 7))
+    assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))
     assert leader.driver.closed
 
 

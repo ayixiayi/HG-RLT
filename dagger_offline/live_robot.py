@@ -91,7 +91,7 @@ def relative_controller(qpos):
     return ContinuousGripper(config, args)
 
 
-# Leader arm actuation (IDs 1-6 only; the trigger servo always stays passive).
+# Leader actuation: joints 1-6 and the (springless) trigger servo.
 # X-series models that support current-based position control (mode 5).
 LEADER_MODELS = {
     1190: "XL330-M077",
@@ -105,10 +105,7 @@ LEADER_MODELS = {
 }
 LEADER_MODE = 5  # current-based position: position goal with a current ceiling
 LEADER_FOLLOW_CURRENT_MA = 1200  # capped by each servo's Current Limit register
-# Calibrated trigger, same scale as the follower gripper: 1 open .. 0 closed.
-LEADER_TRIGGER_RELEASED = 0.7  # at or above: released (must be seen after h)
-LEADER_TRIGGER_SQUEEZED = 0.3  # at or below, after a release: squeezed
-LEADER_TRIGGER_HOLD = 0.5  # s both triggers stay squeezed to take over
+LEADER_TAKEOVER_DELAY = 2.0  # s from h (HOLD, leaders aligned) to human control
 # Twice the follower's speed so a lagging leader catches up (unit 0.229 rpm).
 LEADER_PROFILE_VELOCITY = round(2 * HUMAN_ARM_VELOCITY * 60 / (2 * np.pi) / 0.229)
 ADDR_OPERATING_MODE, ADDR_CURRENT_LIMIT = 11, 38
@@ -185,8 +182,8 @@ class LeaderBus:
 
 
 class Leader:
-    """Calibrated GELLO arm. Passive unless `actuated`: then joints 1-6 can
-    follow the follower pose (see follow/passive); the trigger stays passive."""
+    """Calibrated GELLO arm. Passive unless `actuated`: then joints 1-6 and
+    the trigger follow the follower pose and gripper (see follow/passive)."""
 
     def __init__(self, config, *, actuated=False):
         from gello.dynamixel.driver import DynamixelDriver
@@ -211,7 +208,7 @@ class Leader:
         # A USB reset re-creates the by-id link on a new tty: detect it.
         self.port = agent["port"]
         self._device = os.path.realpath(self.port)
-        self.arm = LeaderBus(self.driver, ids[:6]) if actuated else None
+        self.arm = LeaderBus(self.driver, ids) if actuated else None
         self.following = False
         try:
             self.driver.set_torque_mode(False)
@@ -272,7 +269,8 @@ class Leader:
         return changed_at
 
     def follow(self, qpos7):
-        """Drive joints 1-6 toward follower joints (command space, 7 values).
+        """Drive joints 1-6 toward the follower joints and the trigger toward
+        the follower gripper opening (command space, 7 values).
 
         On the first call after passive, torque turns on holding the leader's
         own present pose, so a set-down leader never snaps; the profile
@@ -280,19 +278,23 @@ class Leader:
         """
         if self.arm is None:
             return
-        target = np.asarray(qpos7, dtype=float)[:6]
-        if target.shape != (6,) or not np.isfinite(target).all():
-            raise ValueError("Leader follow target must be 6 finite joints")
+        target = np.asarray(qpos7, dtype=float)
+        if target.shape != (7,) or not np.isfinite(target).all():
+            raise ValueError("Leader follow target must be 7 finite values")
         if not self.following:
             raw, _ = self.driver.get_joint_sample()
-            self.arm.goal_positions(raw[:6])
-            self.arm.write(ADDR_TORQUE_ENABLE, 1, [1] * 6)
+            self.arm.goal_positions(raw[:7])
+            self.arm.write(ADDR_TORQUE_ENABLE, 1, [1] * 7)
             self.following = True
-        self.arm.goal_positions(target * self.signs[:6] + self.offsets[:6])
+        opening = float(np.clip(target[6], 0, 1))
+        trigger = self.gripper[0] + opening * (self.gripper[1] - self.gripper[0])
+        self.arm.goal_positions(
+            [*(target[:6] * self.signs[:6] + self.offsets[:6]), trigger]
+        )
 
     def passive(self):
         if self.arm is not None and self.following:
-            self.arm.write(ADDR_TORQUE_ENABLE, 1, [0] * 6)
+            self.arm.write(ADDR_TORQUE_ENABLE, 1, [0] * 7)
         self.following = False
 
     def check_connection(self):

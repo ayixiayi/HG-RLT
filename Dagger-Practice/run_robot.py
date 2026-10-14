@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import math
 import os
 import select
 import signal
@@ -298,15 +299,13 @@ def run_loop(
 
     leaders (LeaderFollower or None): when given, the GELLO arms track the
     follower outside human control, and h only arms a takeover: HOLD now,
-    then holding both triggers squeezed hands control to the human.
+    then after LEADER_TAKEOVER_DELAY control passes to the human.
     """
     import numpy as np
 
     from dagger_offline.arbitration import Ownership
     from dagger_offline.live_robot import (
-        LEADER_TRIGGER_HOLD,
-        LEADER_TRIGGER_RELEASED,
-        LEADER_TRIGGER_SQUEEZED,
+        LEADER_TAKEOVER_DELAY,
         PolicyTargetRejected,
         TrackingStalled,
     )
@@ -322,8 +321,8 @@ def run_loop(
     last_cameras = last_leaders = None
     last_follower = None
     pending_keys = []
-    armed = None  # per side: trigger seen released since h (gesture pending)
-    squeezed_since = None  # both triggers squeezed continuously since
+    armed = None  # time of h while a takeover countdown is pending
+    countdown = None  # last whole second announced
 
     def ns(value=None):
         return int((clock.monotonic() if value is None else value) * 1_000_000_000)
@@ -493,12 +492,11 @@ def run_loop(
                     # Stop now; ownership moves only on the trigger gesture.
                     control.control("s", now=now, qpos=snap.qpos)
                     sender.reanchor(snap.qpos)
-                    armed = {side: False for side in snap.leader}
-                    squeezed_since = None
+                    armed, countdown = now, math.ceil(LEADER_TAKEOVER_DELAY)
                     event("takeover armed", force=True)
                     message(
                         "接管准备",
-                        f"已保持。双手握住两只主臂，两个扳机从松开位置同时扣住 {LEADER_TRIGGER_HOLD:g} 秒即接管；s / p 取消",
+                        f"已保持。双手握住两只主臂，{LEADER_TAKEOVER_DELAY:g} 秒后进入人工接管；s / p 取消",
                         level="warning",
                     )
                 elif not repeated:
@@ -521,26 +519,14 @@ def run_loop(
                             "RL", "RL actor 接管策略执行；h 接管 / p 回到 VLA / s 停止"
                         )
             if armed is not None and not any(k in keys for k in ("s", "p", "x")):
-                # Both triggers: an unheld leader would sag and command the
-                # follower toward a pose it cannot reach (leader/follower DoF).
-                trigger = {side: float(snap.leader[side][6]) for side in armed}
-                # A squeeze counts only after that trigger was seen released,
-                # so a trigger already squeezed (or left closed) at h cannot
-                # start the hold, and releasing never reads as squeezing.
-                for side, value in trigger.items():
-                    armed[side] = armed[side] or value >= LEADER_TRIGGER_RELEASED
-                if all(
-                    armed[side] and value <= LEADER_TRIGGER_SQUEEZED
-                    for side, value in trigger.items()
-                ):
-                    squeezed_since = now if squeezed_since is None else squeezed_since
-                else:
-                    squeezed_since = None
-                if (
-                    squeezed_since is not None
-                    and now - squeezed_since >= LEADER_TRIGGER_HOLD
-                ):
-                    armed = squeezed_since = None
+                # HOLD with the leaders aligned to the robot (joints and
+                # trigger) while the operator takes both leaders in hand.
+                left = LEADER_TAKEOVER_DELAY - (now - armed)
+                if left > 0 and math.ceil(left) != countdown:
+                    countdown = math.ceil(left)
+                    message("接管准备", f"{countdown} 秒后接管", level="warning")
+                if left <= 0:
+                    armed = countdown = None
                     leaders.passive()
                     # Leader was held at the follower pose: the relative anchor
                     # starts the human exactly where the robot stands.
@@ -554,7 +540,7 @@ def run_loop(
                     sender.reanchor(snap.qpos)
                     sender.new_segment()
                     event("ownership selected", force=True)
-                    message("接管", "人工接管；夹爪在扳机到达机械臂当前开度后接上")
+                    message("接管", "人工接管：主臂和扳机已放松，按主臂控制")
             if leaders is not None:
                 if control.owner is not Ownership.HUMAN and (
                     leaders.continuous or armed is not None
@@ -797,6 +783,7 @@ def execute(args, config, profile, camera_config, reference, metadata):
     from dagger_offline.live_control import Controller, PolicyWorker, TickLease
     from dagger_offline.live_recording import AsyncEpisodeRecorder
     from dagger_offline.live_robot import (
+        LEADER_TAKEOVER_DELAY,
         GuardedSender,
         Leader,
         LeaderFollower,
@@ -877,9 +864,9 @@ def execute(args, config, profile, camera_config, reference, metadata):
             stack.callback(follower.close)
             message(
                 "主臂",
-                "兼容模式：策略执行时主臂不出力；按 h 后主臂对齐机械臂，再两个扳机同时扣住 0.5 秒接管"
+                f"兼容模式：策略执行时主臂不出力；按 h 后主臂和扳机对齐机械臂，{LEADER_TAKEOVER_DELAY:g} 秒后接管"
                 if on_demand
-                else "主臂会自动跟随机械臂；接管：按 h 后两个扳机同时扣住 0.5 秒",
+                else f"主臂和扳机自动跟随机械臂；按 h 后 {LEADER_TAKEOVER_DELAY:g} 秒进入人工接管",
                 level="warning",
             )
         rig = start_cameras(CameraRig, camera_config)
