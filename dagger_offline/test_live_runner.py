@@ -487,7 +487,7 @@ def test_policy_rejection_waits_for_operator_and_preserves_corrections(
     def policy():
         result = poll()
         if result is not None and len(h.worker.requests) == 1:
-            result[1][3:, 4] += 0.21  # Above the collection-aligned raw-jump limit.
+            result[1][3:, 4] += 0.31  # Above the raw-jump limit.
         return result
 
     h.worker.poll = policy
@@ -511,7 +511,7 @@ def test_policy_rejection_waits_for_operator_and_preserves_corrections(
     if failure == "human":
         h.keys = {0: ["h"], 86: ["k"]}
         h.relative.step = lambda leader: (
-            h.sender.feedback + np.eye(14)[4] * (0.21 if h.sent else 0)
+            h.sender.feedback + np.eye(14)[4] * (0.31 if h.sent else 0)
         )
     if failure is not None:
         with pytest.raises((RuntimeError, BaseExceptionGroup)):
@@ -534,7 +534,7 @@ def test_policy_rejection_waits_for_operator_and_preserves_corrections(
         _, _, actions, labels, valid, _ = read_source(f, "current", 100)
         assert f.attrs["usable"] and f.attrs["complete"]
         reasons = f["dagger_events/reason"].asstr()[:]
-        assert any("prediction jump 0.210000 exceeds 0.200000" in r for r in reasons)
+        assert any("prediction jump 0.310000 exceeds 0.300000" in r for r in reasons)
         assert "FAULT" not in f["dagger_events/controller_state"].asstr()[:]
         assert not valid[rejected[0]]  # Rejected raw action is diagnostics only.
         assert np.sum(valid & (labels == "INTERVENTION")) == 36

@@ -97,7 +97,7 @@ cd "$HOME/Project/HG-RLT"
 | 终端提示 | 含义 | 处理 |
 | --- | --- | --- |
 | `跟随卡住：joint L4 stalled …; check for contact` | 某关节被顶着 3 s 不动，通常是接触或主臂没握住 | 机械臂已 HOLD，本条保留；按 `h` 接管纠正或 `p` 重试 |
-| `策略拒绝：… prediction jump … exceeds 0.200000` | 相邻两次预测跳变过大，未发送 | 已 HOLD；按 `h` 纠正或 `p` 重试 |
+| `策略拒绝：… prediction jump … exceeds 0.300000` | 相邻两次预测跳变过大，未发送 | 已 HOLD；按 `h` 纠正或 `p` 重试 |
 | `主臂串口断开或已重连（USB 断开？）` | 主臂 USB 复位 | 本条中止；检查 USB 线 / 集线器，后续改用 `collect-compat` |
 | `主臂 … 扭矩未能关闭，请给主臂断电` | USB 复位后舵机仍带扭矩 | 给主臂断电再上电 |
 | `set_pu(...) failed … Device or resource busy` | 相机还被上一次进程占用 | 等几秒重新运行；连续出现时拔插相机 |

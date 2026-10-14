@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 
 from dagger_offline.arbitration import Arbiter, Ownership
@@ -163,6 +164,26 @@ def test_prefetch_replaces_remaining_chunk_without_hold_and_skips_executed():
     assert arbiter.generation == generation + 1
     assert arbiter.remaining == 8
     assert arbiter.next_action(now=1.13) == tuple(action(102))
+
+
+def test_continuous_switch_crossfades_from_the_old_chunk():
+    arbiter = Arbiter(now=0, blend=3)
+    first = arbiter.request_policy(observed_at=1, now=1)
+    old = [tuple([0.0] * 14) for _ in range(6)]
+    assert arbiter.accept_policy(first, old, now=1)
+    assert arbiter.next_action(now=1.0) == old[0]
+    prefetch = arbiter.request_policy(observed_at=1.05, now=1.05)
+    assert arbiter.next_action(now=1.07) == old[1]  # runs during inference
+    new = [tuple([0.4] * 14) for _ in range(10)]
+    assert arbiter.accept_policy(prefetch, new, now=1.1)
+    # One executed step skipped; the head fades 0.4 in over 3 steps.
+    steps = [arbiter.next_action(now=1.11)[0] for _ in range(5)]
+    np.testing.assert_allclose(steps, [0.1, 0.2, 0.3, 0.4, 0.4])
+    # A start from HOLD has nothing to fade from.
+    plain = Arbiter(now=0, blend=3)
+    request = plain.request_policy(observed_at=1, now=1)
+    assert plain.accept_policy(request, new, now=1)
+    assert plain.next_action(now=1.0)[0] == 0.4
 
 
 def test_late_prefetch_resumes_after_exhaustion_hold():

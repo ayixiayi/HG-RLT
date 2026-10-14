@@ -43,6 +43,7 @@ class Arbiter:
         human_timeout: float = 1.0,
         observation_timeout: float = 2.0,
         max_skip: int = 12,
+        blend: int = 0,
     ):
         for value in (human_timeout, observation_timeout):
             if not math.isfinite(value) or value <= 0:
@@ -51,6 +52,12 @@ class Arbiter:
             raise ValueError("now must be finite")
         if type(max_skip) is not int or max_skip < 0:
             raise ValueError("max_skip must be a non-negative integer")
+        if type(blend) is not int or blend < 0:
+            raise ValueError("blend must be a non-negative integer")
+        # Continuous chunk switch: crossfade this many steps from the old
+        # chunk's remaining actions into the new one (two predictions of the
+        # same instants rarely agree; a hard switch is a target jump).
+        self._blend = blend
         self._max_skip = max_skip
         self._executed_since_request = 0
         self._human_timeout = human_timeout
@@ -240,6 +247,14 @@ class Arbiter:
             raise ValueError("invalid policy chunk") from error
         for _ in range(skip):
             chunk.popleft()
+        if request.continuous and self._owner is Ownership.POLICY and self._blend:
+            old = list(self._chunk)  # same instants as the new chunk's head
+            n = min(self._blend, len(old), len(chunk))
+            for i in range(n):
+                w = (i + 1) / (n + 1)
+                chunk[i] = tuple(
+                    (1 - w) * a + w * b for a, b in zip(old[i], chunk[i], strict=True)
+                )
         self.last_skip = skip
         if request.continuous:
             # New chunk generation: the sender resets its per-chunk budget.

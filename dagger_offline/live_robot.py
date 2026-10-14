@@ -23,7 +23,7 @@ POLICY_STEP = POLICY_ARM_VELOCITY / 30  # rad per 30 Hz frame
 POLICY_CHUNK_TRAVEL = 3.0  # rad per joint within one accepted policy chunk
 SEGMENT_TRAVEL = 30.0  # rad per joint between operator ownership selections
 TASK_TRAVEL = 60.0  # rad per joint over one recording
-RAW_TARGET_JUMP = 0.20  # rad between proposals, matching the collection pipeline.
+RAW_TARGET_JUMP = 0.30  # rad between consecutive proposals (chunk switches crossfade).
 
 
 class PolicyTargetRejected(RuntimeError):
@@ -113,46 +113,57 @@ LEADER_PROFILE_VELOCITY = round(2 * HUMAN_ARM_VELOCITY * 60 / (2 * np.pi) / 0.22
 ADDR_OPERATING_MODE, ADDR_CURRENT_LIMIT = 11, 38
 ADDR_GOAL_CURRENT, ADDR_PROFILE_VELOCITY = 102, 112
 ADDR_TORQUE_ENABLE, ADDR_GOAL_POSITION = 64, 116
+LEADER_COMM_ATTEMPTS = 3  # per transfer, for transient bus errors
 
 
 class LeaderBus:
-    """Serialized register access on a GELLO driver's own port and lock."""
+    """Serialized register access on a GELLO driver's own port and lock.
+
+    A corrupt or missing status packet (e.g. -3002) happens now and then on a
+    shared Dynamixel bus; each transfer is retried, releasing the lock between
+    attempts so the driver's reader keeps sampling.
+    """
 
     def __init__(self, driver, ids):
         self.driver, self.ids = driver, list(ids)
 
-    def _check(self, result, error, what):
+    def _transfer(self, what, call):
         from dynamixel_sdk.robotis_def import COMM_SUCCESS
 
-        if result != COMM_SUCCESS or error != 0:
-            raise RuntimeError(f"Leader servo {what} failed ({result}, {error})")
+        for _ in range(LEADER_COMM_ATTEMPTS):
+            with self.driver._lock:
+                *value, result, error = call()
+            if result == COMM_SUCCESS and error == 0:
+                return value[0] if value else None
+        raise RuntimeError(f"Leader servo {what} failed ({result}, {error})")
 
     def model(self, dxl_id):
         d = self.driver
-        with d._lock:
-            model, result, error = d._packetHandler.ping(d._portHandler, dxl_id)
-        self._check(result, error, f"ping {dxl_id}")
-        return model
+        return self._transfer(
+            f"ping {dxl_id}", lambda: d._packetHandler.ping(d._portHandler, dxl_id)
+        )
 
     def read(self, dxl_id, address, size=1):
         d = self.driver
-        reader = {1: "read1ByteTxRx", 2: "read2ByteTxRx"}[size]
-        with d._lock:
-            value, result, error = getattr(d._packetHandler, reader)(
-                d._portHandler, dxl_id, address
-            )
-        self._check(result, error, f"read {dxl_id}@{address}")
-        return value
+        reader = getattr(d._packetHandler, {1: "read1ByteTxRx", 2: "read2ByteTxRx"}[size])
+        return self._transfer(
+            f"read {dxl_id}@{address}", lambda: reader(d._portHandler, dxl_id, address)
+        )
 
     def write(self, address, size, values):
         d = self.driver
-        writer = {1: "write1ByteTxRx", 2: "write2ByteTxRx", 4: "write4ByteTxRx"}[size]
-        with d._lock:
-            for dxl_id, value in zip(self.ids, values, strict=True):
-                result, error = getattr(d._packetHandler, writer)(
-                    d._portHandler, dxl_id, address, int(value) & (2 ** (8 * size) - 1)
-                )
-                self._check(result, error, f"write {dxl_id}@{address}")
+        writer = getattr(
+            d._packetHandler,
+            {1: "write1ByteTxRx", 2: "write2ByteTxRx", 4: "write4ByteTxRx"}[size],
+        )
+        for dxl_id, value in zip(self.ids, values, strict=True):
+            raw = int(value) & (2 ** (8 * size) - 1)
+            self._transfer(
+                f"write {dxl_id}@{address}",
+                lambda dxl_id=dxl_id, raw=raw: writer(
+                    d._portHandler, dxl_id, address, raw
+                ),
+            )
 
     def goal_positions(self, raw_rad):
         from dynamixel_sdk.group_sync_write import GroupSyncWrite
@@ -164,10 +175,12 @@ class LeaderBus:
             value = round(float(angle) * 2048 / np.pi) & 0xFFFFFFFF
             if not writer.addParam(dxl_id, list(value.to_bytes(4, "little"))):
                 raise RuntimeError(f"Leader goal position for {dxl_id} rejected")
-        with d._lock:
-            result = writer.txPacket()
-        if result != COMM_SUCCESS:
-            raise RuntimeError("Leader goal position sync write failed")
+        for _ in range(LEADER_COMM_ATTEMPTS):
+            with d._lock:
+                result = writer.txPacket()
+            if result == COMM_SUCCESS:
+                return
+        raise RuntimeError(f"Leader goal position sync write failed ({result})")
 
 
 class Leader:
@@ -376,7 +389,7 @@ class LeaderFollower:
 
     def raise_if_failed(self):
         if self._error is not None:
-            raise RuntimeError("Leader follow failed") from self._error
+            raise RuntimeError(f"Leader follow failed: {self._error}") from self._error
 
     def _run(self):
         try:

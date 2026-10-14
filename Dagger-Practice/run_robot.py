@@ -191,6 +191,7 @@ def preflight(args):
             "replan_lead": 8,
             "skip": "actions executed after the request observation",
             "max_skip": 12,
+            "blend": 8,
         },
         "control_limits": {
             "human_arm_velocity_rad_s": HUMAN_ARM_VELOCITY,
@@ -902,6 +903,7 @@ def execute(args, config, profile, camera_config, reference, metadata):
             worker,
             now=time.monotonic(),
             replan_lead=metadata["policy_execution"]["replan_lead"],
+            blend=metadata["policy_execution"].get("blend", 0),
             rl=agent,
             rl_lead=metadata.get("rlt", {}).get("rl_lead", 0),
         )

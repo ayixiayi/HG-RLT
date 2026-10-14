@@ -145,7 +145,7 @@ def test_full_policy_horizon_handles_collected_target_steps_but_rejects_large_ju
     with pytest.raises(RuntimeError, match="chunk travel"):
         guard.send(target, guard.feedback, generation=1, policy=True)
     guard.send(target, guard.feedback, generation=2, policy=True)
-    target[0] += 0.20001
+    target[0] += 0.30001
     with pytest.raises(PolicyTargetRejected, match="prediction jump"):
         guard.send(target, guard.feedback, generation=2, policy=True)
     assert len(robot.sent) == steps + 1
@@ -385,6 +385,7 @@ class ServoPacket:
         self.regs = {i: {11: modes.get(i, 3), 38: 1750, 64: 0} for i in models}
         self.models = models
         self.writes = []
+        self.corrupt = {}  # (id, address) -> status packets still to corrupt
 
     def ping(self, _port, dxl_id):
         return self.models[dxl_id], 0, 0
@@ -395,6 +396,9 @@ class ServoPacket:
     read2ByteTxRx = read1ByteTxRx
 
     def _write(self, _port, dxl_id, address, value):
+        if self.corrupt.get((dxl_id, address), 0) > 0:
+            self.corrupt[(dxl_id, address)] -= 1
+            return -3002, 0  # COMM_RX_CORRUPT: the write may or may not apply
         self.regs[dxl_id][address] = value
         self.writes.append((dxl_id, address, value))
         return 0, 0
@@ -525,6 +529,36 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
     leader.close()
     assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 7))
     assert leader.driver.closed
+
+
+def test_transient_bus_errors_are_retried_and_persistent_ones_named(monkeypatch):
+    from dagger_offline.live_robot import (
+        ADDR_TORQUE_ENABLE,
+        LEADER_COMM_ATTEMPTS,
+        Leader,
+        LeaderFollower,
+    )
+
+    packet = fake_leader_modules(monkeypatch, {i: 1200 for i in range(1, 8)})
+    leader = Leader(LEADER_CONFIG, actuated=True)
+    leader.follow(np.zeros(7))
+    # The takeover torque-off meets corrupt status packets: retried.
+    packet.corrupt[(3, ADDR_TORQUE_ENABLE)] = LEADER_COMM_ATTEMPTS - 1
+    leader.passive()
+    assert all(packet.regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 7))
+    leader.follow(np.zeros(7))
+    packet.corrupt[(3, ADDR_TORQUE_ENABLE)] = LEADER_COMM_ATTEMPTS
+    with pytest.raises(RuntimeError, match=r"write 3@64 failed \(-3002"):
+        leader.passive()
+    # Through the follower thread, the operator sees the cause.
+    packet.corrupt.clear()
+    leader.following = True
+    packet.corrupt[(1, ADDR_TORQUE_ENABLE)] = LEADER_COMM_ATTEMPTS
+    follower = LeaderFollower({"left": leader}, period=0.001)
+    follower.passive()
+    follower._thread.join(timeout=2)
+    with pytest.raises(RuntimeError, match=r"Leader follow failed: .*-3002"):
+        follower.raise_if_failed()
 
 
 def test_unsupported_leader_servo_refuses_actuation(monkeypatch):

@@ -86,6 +86,7 @@ class Controller:
         horizon=30,
         timeout=0.2,
         replan_lead=8,
+        blend=0,
         rl=None,
         rl_lead=0,
     ):
@@ -93,7 +94,7 @@ class Controller:
             raise ValueError("execution horizon must be 1..30")
         if not isinstance(replan_lead, int) or not 0 <= replan_lead < horizon:
             raise ValueError("replan lead must be 0 (no prefetch) .. horizon-1")
-        self.arbiter = Arbiter(now=now, human_timeout=timeout)
+        self.arbiter = Arbiter(now=now, human_timeout=timeout, blend=blend)
         self.relative, self.worker = relative, worker
         self.horizon, self.timeout = horizon, timeout
         # Request the next chunk when this many actions remain, so consecutive
