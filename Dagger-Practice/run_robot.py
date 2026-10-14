@@ -920,6 +920,7 @@ def execute(args, config, profile, camera_config, reference, metadata):
                 rlt.RLTConfig(**settings["config"]),
                 Path(settings["run"]) / "actor",
                 max_deviation=settings["max_deviation"],
+                policy_id=settings["policy_id"],
             )
             message(
                 "RL", f"RLT 已启用：r 交给 RL actor；actor 目录 {settings['run']}/actor"

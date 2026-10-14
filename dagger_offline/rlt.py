@@ -185,12 +185,16 @@ class RLAgent:
     """Collector-side decision maker: latest published actor (or the initial,
     reference-following one), plus a hard bound on deviation from ã."""
 
-    def __init__(self, config, actor_directory, *, max_deviation=0.15, seed=0):
+    def __init__(
+        self, config, actor_directory, *, max_deviation=0.15, seed=0, policy_id=None
+    ):
         if max_deviation <= 0:
             raise ValueError("max_deviation must be positive")
         self.config, self.chunk = config, config.chunk
         self.max_deviation = max_deviation
-        self.watcher = ActorWatcher(actor_directory, config, seed=seed)
+        self.watcher = ActorWatcher(
+            actor_directory, config, seed=seed, policy_id=policy_id
+        )
         self._initial = Actor(config, init_actor(config), version=0, seed=seed)
 
     def decide(self, token, qpos, previous_qpos, reference):
@@ -224,7 +228,22 @@ def bind_run(run, policy_id):
                 f"RLT 运行目录 {run} 属于另一个模型（{bound[:12]}）；新模型请用新目录"
             )
         return
+    trained = (
+        (run / "actor" / "actor.npz").exists()
+        or (run / "learner.pkl").exists()
+        or any((run / "replay").glob("*.npz"))
+    )
+    if trained:
+        raise ValueError(
+            f"RLT 运行目录 {run} 已有未绑定模型的训练结果；新模型请用新目录"
+        )
     marker.write_text(json.dumps({"policy_id": policy_id}) + "\n")
+
+
+def bound_policy(run):
+    """The model a run directory is bound to (None until a collector binds it)."""
+    marker = Path(run) / "model.json"
+    return json.loads(marker.read_text())["policy_id"] if marker.exists() else None
 
 
 def _atomic_write(path, data: bytes):
@@ -268,7 +287,7 @@ def run_config(run, override=None):
 # ---------------------------------------------------------------- publication
 
 
-def publish_actor(directory, config, params, version):
+def publish_actor(directory, config, params, version, policy_id=None):
     """Atomically replace ``actor.npz`` (never a partially written file)."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -278,6 +297,7 @@ def publish_actor(directory, config, params, version):
             {
                 "version": int(version),
                 "config": config.actor_digest(),
+                "policy_id": policy_id,
                 "time": time.time(),
             }
         ).encode(),
@@ -291,12 +311,16 @@ def publish_actor(directory, config, params, version):
     os.replace(temporary, directory / "actor.npz")
 
 
-def load_actor(directory, config):
+def load_actor(directory, config, policy_id=None):
     path = Path(directory) / "actor.npz"
     with np.load(path) as data:
         meta = json.loads(bytes(data["meta"]).decode())
         if meta["config"] != config.actor_digest():
             raise ValueError("Published actor was trained with a different RLT config")
+        if policy_id is not None and meta.get("policy_id") != policy_id:
+            raise ValueError(
+                f"Published actor belongs to model {meta.get('policy_id')}, not {policy_id}"
+            )
         params = {k[2:]: data[k].copy() for k in data.files if k.startswith("p_")}
     return params, meta["version"]
 
@@ -304,8 +328,9 @@ def load_actor(directory, config):
 class ActorWatcher:
     """Collector side: reload when a newer publication appears (block edges)."""
 
-    def __init__(self, directory, config, *, seed=0):
+    def __init__(self, directory, config, *, seed=0, policy_id=None):
         self.directory, self.config = Path(directory), config
+        self.policy_id = policy_id
         self._mtime = None
         self.actor = None
         self._seed = seed
@@ -317,7 +342,7 @@ class ActorWatcher:
         except FileNotFoundError:
             return self.actor
         if mtime != self._mtime:
-            params, version = load_actor(self.directory, self.config)
+            params, version = load_actor(self.directory, self.config, self.policy_id)
             self.actor = Actor(self.config, params, version=version, seed=self._seed)
             self._mtime = mtime
         return self.actor
@@ -509,7 +534,7 @@ class Learner:
     def actor_numpy(self):
         return {k: np.asarray(v) for k, v in self.actor.items()}
 
-    def save_state(self, path, *, version, processed):
+    def save_state(self, path, *, version, processed, policy_id=None):
         """Everything needed to continue training exactly (atomic)."""
         import pickle
 
@@ -518,6 +543,7 @@ class Learner:
             "actor_digest": self.config.actor_digest(),
             "replay_digest": self.config.replay_digest(),
             "version": int(version),
+            "policy_id": policy_id,
             "processed": sorted(processed),
             "updates": self.updates,
             "key": np.asarray(jax.random.key_data(self.key)),
@@ -534,7 +560,7 @@ class Learner:
         }
         _atomic_write(path, pickle.dumps(state))
 
-    def load_state(self, path):
+    def load_state(self, path, policy_id=None):
         import pickle
 
         jax, jnp = self.jax, self.jnp
@@ -544,6 +570,10 @@ class Learner:
             or state["replay_digest"] != self.config.replay_digest()
         ):
             raise ValueError("Saved learner state belongs to a different RLT config")
+        if policy_id is not None and state.get("policy_id") != policy_id:
+            raise ValueError(
+                f"Saved learner state belongs to model {state.get('policy_id')}, not {policy_id}"
+            )
         trees = jax.tree.map(jnp.asarray, state["trees"])
         self.actor, self.critics = trees["actor"], list(trees["critics"])
         self.target_actor = trees["target_actor"]

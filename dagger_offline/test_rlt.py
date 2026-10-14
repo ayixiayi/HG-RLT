@@ -227,3 +227,40 @@ def test_learner_state_round_trip_continues_identically(tmp_path):
     for key, value in a.actor_numpy().items():
         np.testing.assert_allclose(b.actor_numpy()[key], value, rtol=1e-6, atol=1e-6)
     assert a.updates == b.updates
+
+
+def test_run_artifacts_are_bound_to_one_model(tmp_path):
+    rlt.publish_actor(tmp_path / "actor", SMALL, rlt.init_actor(SMALL), 1, "m1")
+    assert rlt.load_actor(tmp_path / "actor", SMALL, "m1")[1] == 1
+    with pytest.raises(ValueError, match="not m2"):
+        rlt.load_actor(tmp_path / "actor", SMALL, "m2")
+    # Training output without a binding cannot be claimed by a model later.
+    with pytest.raises(ValueError, match="未绑定"):
+        rlt.bind_run(tmp_path, "m2")
+    fresh = tmp_path / "fresh"
+    rlt.bind_run(fresh, "m1")
+    assert rlt.bound_policy(fresh) == "m1"
+    with pytest.raises(ValueError, match="另一个模型"):
+        rlt.bind_run(fresh, "m2")
+    watcher = rlt.ActorWatcher(tmp_path / "actor", SMALL, policy_id="m2")
+    with pytest.raises(ValueError, match="not m2"):
+        watcher.poll()
+
+
+def test_learner_waits_for_the_binding_and_states_name_their_model(tmp_path):
+    pytest.importorskip("jax")
+    from dagger_offline import rlt_learn
+
+    run, recordings = tmp_path / "run", tmp_path / "rec"
+    (recordings / "episodes").mkdir(parents=True)
+    # Unbound: nothing is trained, published or bound.
+    assert rlt_learn.learn(recordings, run, SMALL, once=True) == 0
+    assert not (run / "actor").exists() and not (run / "learner.pkl").exists()
+    rlt.bind_run(run, "m1")
+    learner = rlt.Learner(SMALL)
+    learner.save_state(run / "learner.pkl", version=3, processed=set(), policy_id="m1")
+    with pytest.raises(ValueError, match="not m2"):
+        rlt.Learner(SMALL).load_state(run / "learner.pkl", "m2")
+    # A bound run with state but no actor republishes it for its model.
+    assert rlt_learn.learn(recordings, run, SMALL, once=True) == 3
+    assert rlt.load_actor(run / "actor", SMALL, "m1")[1] == 3

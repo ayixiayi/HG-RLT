@@ -228,8 +228,21 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
         run / "learner.pkl",
     )
     learner = rlt.Learner(config)
+    # Train only for a bound model: the collector binds RUN to its sealed
+    # model (model.json) when `collect --rlt RUN` starts.
+    policy_id = rlt.bound_policy(run)
+    if policy_id is None:
+        message(
+            "RLT learner",
+            f"等待采集端绑定模型：{run}/model.json 在 collect --rlt 启动时写入",
+        )
+    while policy_id is None:
+        if once:
+            return 0
+        time.sleep(poll_s)
+        policy_id = rlt.bound_policy(run)
     if state_path.exists():
-        version, processed = learner.load_state(state_path)
+        version, processed = learner.load_state(state_path, policy_id)
         message(
             "RLT learner",
             f"恢复训练状态：actor v{version} · 已训练 {len(processed)} 个分片",
@@ -238,12 +251,16 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
         # the two leaves the actor missing or behind: publish it from the state.
         published = None
         if (actor_dir / "actor.npz").exists():
-            _, published = rlt.load_actor(actor_dir, config)
+            _, published = rlt.load_actor(actor_dir, config, policy_id)
         if version and published != version:
             if published is not None and published > version:
                 version = published + 1  # never step a watched version back
-                learner.save_state(state_path, version=version, processed=processed)
-            rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
+                learner.save_state(
+                    state_path, version=version, processed=processed, policy_id=policy_id
+                )
+            rlt.publish_actor(
+                actor_dir, config, learner.actor_numpy(), version, policy_id
+            )
             message("RLT learner", f"按训练状态补发 actor v{version}", level="warning")
     elif (actor_dir / "actor.npz").exists():
         raise RuntimeError(
@@ -253,10 +270,6 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
         version, processed = 0, set()
     message("RLT learner", f"录制 {recordings} → {run}；等待带 RL 决策的已标注录制")
     while True:
-        marker = run / "model.json"
-        policy_id = (
-            json.loads(marker.read_text())["policy_id"] if marker.exists() else None
-        )
         sync_replay(recordings, replay_dir, config, policy_id)
         shards = (
             {p.name for p in replay_dir.glob("*.npz")} if replay_dir.exists() else set()
@@ -273,8 +286,12 @@ def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once
             version += 1
             processed |= set(fresh)
             # State first: a restart can always re-publish this actor from it.
-            learner.save_state(state_path, version=version, processed=processed)
-            rlt.publish_actor(actor_dir, config, learner.actor_numpy(), version)
+            learner.save_state(
+                state_path, version=version, processed=processed, policy_id=policy_id
+            )
+            rlt.publish_actor(
+                actor_dir, config, learner.actor_numpy(), version, policy_id
+            )
             message(
                 "RLT learner",
                 f"actor v{version} 已发布 · replay {size} · 新增 {added} · "

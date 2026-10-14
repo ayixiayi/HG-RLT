@@ -335,7 +335,7 @@ class Leader:
             if self.arm is not None:
                 # Unconditional: an interrupted enable must not leave torque on.
                 try:
-                    self.arm.write(ADDR_TORQUE_ENABLE, 1, [0] * 6)
+                    self.arm.write(ADDR_TORQUE_ENABLE, 1, [0] * len(self.arm.ids))
                 except Exception as exc:  # noqa: BLE001 - retried on a fresh port
                     self._release_on_fresh_port(exc)
                 self.following = False

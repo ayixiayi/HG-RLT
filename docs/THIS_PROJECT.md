@@ -227,7 +227,7 @@ RLT 冻结 VLA，在实验室在线训练一个小 actor，精修关键阶段的
 "$HOME/Project/HG-RLT/hgrlt" serve-round --deployment models/heavier-r1/deployment.json
 ```
 
-终端 C，启动 learner 并保持窗口（CPU 运行，不占显卡）：
+终端 C，启动 learner 并保持窗口（CPU 运行，不占显卡；终端 B 开始采集、目录绑定模型之前，learner 只等待）：
 
 ```bash
 cd "$HOME/Project/HG-RLT"

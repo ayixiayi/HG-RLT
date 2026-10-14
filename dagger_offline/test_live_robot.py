@@ -715,3 +715,17 @@ def test_driver_reader_serial_tracebacks_are_dropped_others_kept(monkeypatch):
         thread.start()
         thread.join()
     assert seen == [ValueError]
+
+
+def test_healthy_close_releases_all_seven_without_port_recovery(monkeypatch):
+    from dagger_offline.live_robot import ADDR_TORQUE_ENABLE, Leader
+
+    packet = fake_leader_modules(monkeypatch, {i: 1200 for i in range(1, 8)})
+    leader = Leader(LEADER_CONFIG, actuated=True)
+    leader.follow(np.zeros(7))
+    assert all(packet.regs[i][ADDR_TORQUE_ENABLE] == 1 for i in range(1, 8))
+    recovered = []
+    monkeypatch.setattr(leader, "_release_on_fresh_port", recovered.append)
+    leader.close()  # no passive() first: the fallback itself must cover all 7
+    assert not recovered
+    assert all(packet.regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))

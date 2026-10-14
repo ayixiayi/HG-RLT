@@ -2240,6 +2240,8 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
 
     config = rlt.RLTConfig(token_dim=8, hidden=32, batch=32)
     run, recordings = tmp_path / "run", tmp_path / "rec"
+    rlt.bind_run(run, "m1")
+    meta = {"rlt": {"policy_id": "m1"}}
     for i in (1, 2):
         h = _rl_harness(
             recordings / f"episodes/episode-00000{i}.h5",
@@ -2247,7 +2249,7 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
             run,
             config,
         )
-        h.run(review=lambda: "success", metadata={"collection": {"group": str(i)}})
+        h.run(review=lambda: "success", metadata={"collection": {"group": str(i)}, **meta})
         version = rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
         assert version == i  # the restarted learner continues the version
     # Interrupted between saving the state and publishing the actor: the
@@ -2255,7 +2257,7 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
     h = _rl_harness(
         recordings / "episodes/episode-000003.h5", {0: ["r"], 90: ["k"]}, run, config
     )
-    h.run(review=lambda: "success", metadata={"collection": {"group": "3"}})
+    h.run(review=lambda: "success", metadata={"collection": {"group": "3"}, **meta})
     publish = rlt.publish_actor
 
     def interrupted(*args, **kwargs):
@@ -2267,9 +2269,9 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
             rlt_learn.learn(recordings, run, config, min_transitions=1, once=True)
     finally:
         rlt.publish_actor = publish
-    assert rlt.load_actor(run / "actor", config)[1] == 2
+    assert rlt.load_actor(run / "actor", config, "m1")[1] == 2
     assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 3
-    assert rlt.load_actor(run / "actor", config)[1] == 3
+    assert rlt.load_actor(run / "actor", config, "m1")[1] == 3
     state = (run / "learner.pkl").read_bytes()
     (run / "learner.pkl").unlink()
     with pytest.raises(RuntimeError, match="拒绝覆盖"):
