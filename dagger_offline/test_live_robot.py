@@ -528,6 +528,18 @@ def test_actuated_leader_selects_mode_follows_with_inverse_map_and_releases(
     leader.driver.raw[6] = trigger
     assert leader.sample()[0][6] == pytest.approx(0.9)
     assert all(regs[i][ADDR_TORQUE_ENABLE] == 1 for i in range(1, 8))
+    # Takeover confirmation: trigger unpowered, joints keep following.
+    leader.follow(target, trigger=False)
+    assert regs[7][ADDR_TORQUE_ENABLE] == 0
+    assert all(regs[i][ADDR_TORQUE_ENABLE] == 1 for i in range(1, 7))
+    leader.driver.raw[6] = np.deg2rad(160.0)  # the operator's squeeze
+    before = len(packet.writes)
+    leader.follow(target, trigger=True)
+    trigger_writes = [w for w in packet.writes[before:] if w[0] == 7]
+    # Re-powered holding where the finger left it, then sent to the gripper.
+    assert trigger_writes[0] == (7, ADDR_GOAL_POSITION, round(np.deg2rad(160.0) * 2048 / np.pi))
+    assert regs[7][ADDR_TORQUE_ENABLE] == 1
+    assert regs[7][ADDR_GOAL_POSITION] == round(trigger * 2048 / np.pi)
     leader.passive()
     assert all(regs[i][ADDR_TORQUE_ENABLE] == 0 for i in range(1, 8))
     leader.follow(target)

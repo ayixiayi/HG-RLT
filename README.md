@@ -21,7 +21,7 @@ cd "$HOME/Project/HG-RLT"
 - `./hgrlt help`：查看采集、数据准备、上传下载及服务命令。
 
 采集入口：`./hgrlt collect`（主臂全程跟随机械臂）、`./hgrlt collect-compat`（主臂只在按 `h` 后对齐，适合 USB 集线器不稳时）。
-接管：按 `h` 停住机械臂，双手握住两只主臂，2 秒后进入人工接管。
+接管：按 `h` 停住机械臂、扳机断电，双手握住两只主臂，两个扳机各自完全松开再扣到底，扳机回位后进入人工接管。
 RLT：采集加 `--rlt DIR`，关键阶段按 `r` 交给 RL actor；另开终端运行 `./hgrlt rlt-learn`（执行手册第 9 节）。
 
 源码位于 `Dagger-Practice/`、`dagger_offline/`；运行依赖位于 `vendor/`、`envs/`、`runtime/`。

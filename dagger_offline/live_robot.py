@@ -105,7 +105,11 @@ LEADER_MODELS = {
 }
 LEADER_MODE = 5  # current-based position: position goal with a current ceiling
 LEADER_FOLLOW_CURRENT_MA = 1200  # capped by each servo's Current Limit register
-LEADER_TAKEOVER_DELAY = 2.0  # s from h (HOLD, leaders aligned) to human control
+# Takeover confirmation on the calibrated trigger (1 open .. 0 closed): with
+# the triggers unpowered, each is opened fully, then squeezed fully.
+LEADER_TRIGGER_OPEN = 0.8
+LEADER_TRIGGER_CLOSED = 0.2
+LEADER_TRIGGER_MATCH = 0.05  # re-powered trigger back at the robot gripper
 # Twice the follower's speed so a lagging leader catches up (unit 0.229 rpm).
 LEADER_PROFILE_VELOCITY = round(2 * HUMAN_ARM_VELOCITY * 60 / (2 * np.pi) / 0.229)
 ADDR_OPERATING_MODE, ADDR_CURRENT_LIMIT = 11, 38
@@ -163,13 +167,13 @@ class LeaderBus:
                 ),
             )
 
-    def goal_positions(self, raw_rad):
+    def goal_positions(self, raw_rad, ids=None):
         from dynamixel_sdk.group_sync_write import GroupSyncWrite
         from dynamixel_sdk.robotis_def import COMM_SUCCESS
 
         d = self.driver
         writer = GroupSyncWrite(d._portHandler, d._packetHandler, ADDR_GOAL_POSITION, 4)
-        for dxl_id, angle in zip(self.ids, raw_rad, strict=True):
+        for dxl_id, angle in zip(self.ids if ids is None else ids, raw_rad, strict=True):
             value = round(float(angle) * 2048 / np.pi) & 0xFFFFFFFF
             if not writer.addParam(dxl_id, list(value.to_bytes(4, "little"))):
                 raise RuntimeError(f"Leader goal position for {dxl_id} rejected")
@@ -209,7 +213,7 @@ class Leader:
         self.port = agent["port"]
         self._device = os.path.realpath(self.port)
         self.arm = LeaderBus(self.driver, ids) if actuated else None
-        self.following = False
+        self.following = self.trigger_following = False
         try:
             self.driver.set_torque_mode(False)
             ready_after = -np.inf
@@ -268,34 +272,44 @@ class Leader:
         self.arm.write(ADDR_PROFILE_VELOCITY, 4, [LEADER_PROFILE_VELOCITY] * count)
         return changed_at
 
-    def follow(self, qpos7):
-        """Drive joints 1-6 toward the follower joints and the trigger toward
-        the follower gripper opening (command space, 7 values).
+    def follow(self, qpos7, *, trigger=True):
+        """Drive joints 1-6 toward the follower joints and, with ``trigger``,
+        the trigger toward the follower gripper opening (7 values).
 
-        On the first call after passive, torque turns on holding the leader's
-        own present pose, so a set-down leader never snaps; the profile
-        velocity then limits travel toward the follower.
+        Joints or trigger that were unpowered turn on holding their own
+        present pose, so nothing snaps; the profile velocity then limits
+        travel toward the follower. ``trigger=False`` leaves the trigger
+        unpowered (takeover confirmation) while the joints keep following.
         """
         if self.arm is None:
             return
         target = np.asarray(qpos7, dtype=float)
         if target.shape != (7,) or not np.isfinite(target).all():
             raise ValueError("Leader follow target must be 7 finite values")
+        joints, grip = self.arm.ids[:6], self.arm.ids[6:]
         if not self.following:
             raw, _ = self.driver.get_joint_sample()
-            self.arm.goal_positions(raw[:7])
-            self.arm.write(ADDR_TORQUE_ENABLE, 1, [1] * 7)
+            self.arm.goal_positions(raw[:6], joints)
+            LeaderBus(self.driver, joints).write(ADDR_TORQUE_ENABLE, 1, [1] * 6)
             self.following = True
-        opening = float(np.clip(target[6], 0, 1))
-        trigger = self.gripper[0] + opening * (self.gripper[1] - self.gripper[0])
-        self.arm.goal_positions(
-            [*(target[:6] * self.signs[:6] + self.offsets[:6]), trigger]
-        )
+        if trigger and not self.trigger_following:
+            raw, _ = self.driver.get_joint_sample()
+            self.arm.goal_positions(raw[6:7], grip)
+            LeaderBus(self.driver, grip).write(ADDR_TORQUE_ENABLE, 1, [1])
+            self.trigger_following = True
+        elif not trigger and self.trigger_following:
+            LeaderBus(self.driver, grip).write(ADDR_TORQUE_ENABLE, 1, [0])
+            self.trigger_following = False
+        goals = list(target[:6] * self.signs[:6] + self.offsets[:6])
+        if trigger:
+            opening = float(np.clip(target[6], 0, 1))
+            goals.append(self.gripper[0] + opening * (self.gripper[1] - self.gripper[0]))
+        self.arm.goal_positions(goals, self.arm.ids[: len(goals)])
 
     def passive(self):
-        if self.arm is not None and self.following:
+        if self.arm is not None and (self.following or self.trigger_following):
             self.arm.write(ADDR_TORQUE_ENABLE, 1, [0] * 7)
-        self.following = False
+        self.following = self.trigger_following = False
 
     def check_connection(self):
         reader = getattr(self.driver, "_reading_thread", None)
@@ -373,18 +387,20 @@ class LeaderFollower:
         self.leaders = dict(leaders)
         self._lock = threading.Lock()
         self._targets = None
+        self._trigger = True
         self._error = None
         self._stop = threading.Event()
         self._period = period
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def follow(self, qpos):
+    def follow(self, qpos, *, trigger=True):
         qpos = np.asarray(qpos, dtype=float)
         if qpos.shape != (14,) or not np.isfinite(qpos).all():
             raise ValueError("Leader follow requires the 14-D follower state")
         with self._lock:
             self._targets = {"left": qpos[:7].copy(), "right": qpos[7:].copy()}
+            self._trigger = trigger
 
     def passive(self):
         with self._lock:
@@ -398,12 +414,12 @@ class LeaderFollower:
         try:
             while not self._stop.is_set():
                 with self._lock:
-                    targets = self._targets
+                    targets, trigger = self._targets, self._trigger
                 for side, leader in self.leaders.items():
                     if targets is None:
                         leader.passive()
                     else:
-                        leader.follow(targets[side])
+                        leader.follow(targets[side], trigger=trigger)
                 self._stop.wait(self._period)
         except Exception as exc:  # noqa: BLE001 - reported on the control thread
             self._error = exc
