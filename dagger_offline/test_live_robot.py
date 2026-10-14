@@ -690,3 +690,28 @@ def test_driver_output_hides_dynamixel_chatter_and_keeps_the_rest():
     assert out.getvalue().endswith("回车开始：")
     stream.write("\n")
     assert "comm failed" not in out.getvalue()
+
+
+def test_driver_reader_serial_tracebacks_are_dropped_others_kept(monkeypatch):
+    import threading
+
+    import serial
+
+    from dagger_offline import console
+
+    seen = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: seen.append(args.exc_type))
+    console.quiet_driver_readers()
+    console.quiet_driver_readers()  # idempotent
+
+    def _read_joint_states():
+        raise serial.SerialException("device reports readiness to read but returned no data")
+
+    def other():
+        raise ValueError("kept")
+
+    for target in (_read_joint_states, other):
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join()
+    assert seen == [ValueError]

@@ -112,9 +112,38 @@ class DriverOutput:
         return getattr(self.stream, name)
 
 
+def _driver_reader(args):
+    """A GELLO driver reader thread ending on a serial error: when its port is
+    closed under it (normal at shutdown) or the adapter drops. The leader's
+    connection check reports a real loss in the console format."""
+    import serial
+
+    target = getattr(args.thread, "_target", None)
+    name = getattr(target, "__name__", "") or getattr(args.thread, "name", "")
+    return "_read_joint_states" in str(name) and issubclass(
+        args.exc_type, (serial.SerialException, OSError, TypeError)
+    )
+
+
+def quiet_driver_readers():
+    """Drop driver reader-thread serial tracebacks for the rest of the
+    process (they can still unwind after the drivers closed). Idempotent."""
+    previous = threading.excepthook
+    if getattr(previous, "quiet_driver_readers", False):
+        return
+
+    def hook(args):
+        if not _driver_reader(args):
+            previous(args)
+
+    hook.quiet_driver_readers = True
+    threading.excepthook = hook
+
+
 @contextlib.contextmanager
 def driver_output():
     """Route stdout through DriverOutput while hardware drivers run."""
+    quiet_driver_readers()
     previous = sys.stdout
     sys.stdout = DriverOutput(previous)
     try:
