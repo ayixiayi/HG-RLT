@@ -100,7 +100,7 @@ cd "$HOME/Project/HG-RLT"
 | `策略拒绝：… prediction jump … exceeds 0.300000` | 相邻两次预测跳变过大，未发送 | 已 HOLD；按 `h` 纠正或 `p` 重试 |
 | `主臂串口断开或已重连（USB 断开？）` | 主臂 USB 复位 | 本条中止；检查 USB 线 / 集线器，后续改用 `collect-compat` |
 | `主臂 … 扭矩未能关闭，请给主臂断电` | USB 复位后舵机仍带扭矩 | 给主臂断电再上电 |
-| `set_pu(...) failed … Device or resource busy` | 相机还被上一次进程占用 | 等几秒重新运行；连续出现时拔插相机 |
+| `set_pu(...) failed … Device or resource busy` | 相机还没从上一条释放 | 启动时自动重试 3 次（间隔 1 秒）；仍失败时重新运行，连续出现时拔插相机 |
 | `Confirmed SAFE_HOLD required` | 硬件进程不在 HOLD 或已 FAULT | 托住双臂执行 `./hgrlt daemon-restart` |
 | `Policy request failed` | 模型服务没就绪或断开 | 确认终端 A 的服务在监听，`./hgrlt warmup` 通过后再采 |
 

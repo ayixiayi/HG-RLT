@@ -1264,7 +1264,7 @@ def test_execute_startup_failure_closes_owned_readers_and_journals(
         calls.append(config)
         if len(calls) == 2:
             raise OSError("second leader unavailable")
-        return SimpleNamespace(close=lambda: closed.append("left"))
+        return SimpleNamespace(close=lambda: closed.append("left"), port="/dev/l")
 
     monkeypatch.setattr(robot_module, "Leader", leader)
     config = tmp_path / "arm.yaml"

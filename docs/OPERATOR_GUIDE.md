@@ -477,7 +477,7 @@ printf '粘贴模型完整 OSS 地址：'; IFS= read -r MODEL_SOURCE
 | `主臂 … 扭矩未能关闭，请给主臂断电` | USB 复位后重开串口仍关不掉扭矩；给主臂断电 |
 | `A leader is stale` | 主臂采样超过 0.2 s 未更新；检查主臂串口和供电 |
 | `Leader servo … model … cannot follow` | 舵机型号不支持模式 5；加 `--passive-leaders` |
-| `set_pu(...) failed … Device or resource busy` | 相机仍被上一进程占用；稍等重试，持续出现时拔插相机 |
+| `set_pu(...) failed … Device or resource busy` | 相机还没从上一条释放；启动时自动重试 3 次（间隔 1 秒），仍失败时重新运行，持续出现时拔插相机 |
 | `Confirmed SAFE_HOLD required` / `fault` | 硬件进程不在 HOLD；托住双臂 `./hgrlt daemon-restart` |
 | `Daemon requires exclusive session_api_version=1` | 运行的是旧硬件进程；`./hgrlt daemon-restart` 换成本项目的硬件进程 |
 | `Policy request failed` | 模型服务未就绪或断开；确认服务监听后 `./hgrlt warmup` |

@@ -613,3 +613,63 @@ def test_wrist_pitch_gets_its_own_tracking_allowance(policy):
     wrist = WRIST_PITCH_TRACKING_ERROR - 0.005
     np.testing.assert_allclose(applied[[3, 10]], [-wrist, wrist])
     assert abs(applied[0]) < wrist  # joints 1-3 keep their tighter bound
+
+
+def test_camera_start_retries_a_busy_device_with_a_fresh_rig():
+    from dagger_offline.live_robot import start_cameras
+
+    rigs, waits = [], []
+
+    class Rig:
+        failures = 1
+
+        def __init__(self, config, depth_enabled):
+            assert not depth_enabled
+            self.closed = self.started = False
+            rigs.append(self)
+
+        def start(self):
+            if Rig.failures:
+                Rig.failures -= 1
+                raise RuntimeError(
+                    "set_pu(id=4) failed! Last Error: Device or resource busy"
+                )
+            self.started = True
+
+        def begin_episode(self):
+            assert self.started
+
+        def close(self):
+            self.closed = True
+
+    rig = start_cameras(Rig, "cfg", sleep=waits.append)
+    assert rig is rigs[1] and rigs[0].closed and not rig.closed and waits == [1.0]
+    Rig.failures, rigs[:] = 5, []
+    with pytest.raises(RuntimeError, match="Device or resource busy"):
+        start_cameras(Rig, "cfg", sleep=waits.append)
+    assert len(rigs) == 3 and all(r.closed for r in rigs)
+
+
+def test_driver_output_hides_dynamixel_chatter_and_keeps_the_rest():
+    import io
+
+    from dagger_offline.console import DriverOutput
+    from dagger_offline.live_robot import leader_name
+
+    out = io.StringIO()
+    stream = DriverOutput(out)
+    stream.write("Attempting to initialize Dynamixel driver (attempt 1/3)\n")
+    stream.write("Successfully initialized Dynamixel driver on /dev/x\nwarning, comm ")
+    stream.write("failed: -3002\nwarning, comm failed: -3001\nother line\n")
+    stream.write("Attempting to initialize Dynamixel driver (attempt 2/3)\n")
+    text = out.getvalue()
+    assert "Dynamixel" not in text and "comm failed" not in text
+    assert "other line\n" in text and "串口连接重试 2/3" in text
+    port = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBSX7UI-if00-port0"
+    assert leader_name(port) == "FTBSX7UI"
+    stream.write("回车开始：")
+    stream.write("warning, comm failed: -3002")  # newline not yet written
+    stream.flush()
+    assert out.getvalue().endswith("回车开始：")
+    stream.write("\n")
+    assert "comm failed" not in out.getvalue()

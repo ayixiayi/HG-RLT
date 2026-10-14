@@ -1,6 +1,7 @@
 """RhOSPolicy adapter. Imports and hardware construction are explicit, never on import."""
 
 import os
+import re
 import time
 from types import SimpleNamespace
 
@@ -415,6 +416,39 @@ class LeaderFollower:
         self.passive()
         self._stop.set()
         self._thread.join(timeout=1.0)
+
+
+def leader_name(port):
+    """Short operator-facing name of a leader serial port (adapter serial)."""
+    match = re.search(r"_([A-Za-z0-9]{6,})-if\d+", str(port))
+    return match.group(1) if match else os.path.basename(str(port))
+
+
+def start_cameras(factory, config, *, attempts=3, wait=1.0, sleep=time.sleep):
+    """Open the camera rig, retrying transient start failures.
+
+    RealSense devices closed by the previous episode can still be busy for a
+    moment (``set_pu(...) failed ... Device or resource busy``); each attempt
+    uses a fresh rig after closing the failed one.
+    """
+    from dagger_offline.console import message
+
+    for attempt in range(1, attempts + 1):
+        rig = factory(config, depth_enabled=False)
+        try:
+            rig.start()
+            rig.begin_episode()
+            return rig
+        except Exception as exc:
+            rig.close()
+            if attempt == attempts:
+                raise
+            message(
+                "相机",
+                f"启动失败，{wait:g} 秒后重试（{attempt}/{attempts - 1}）：{exc}",
+                level="warning",
+            )
+            sleep(wait)
 
 
 class GuardedSender:

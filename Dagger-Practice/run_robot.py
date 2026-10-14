@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dagger_offline.console import message, show_controls, show_mode
+from dagger_offline.console import driver_output, message, show_controls, show_mode
 
 REVISION = "d0832d12651d1b260a652861a14648dc5f3660c7"
 
@@ -800,7 +800,9 @@ def execute(args, config, profile, camera_config, reference, metadata):
         GuardedSender,
         Leader,
         LeaderFollower,
+        leader_name,
         relative_controller,
+        start_cameras,
     )
 
     actuated = not getattr(args, "passive_leaders", False)
@@ -859,13 +861,15 @@ def execute(args, config, profile, camera_config, reference, metadata):
         initial = unpack_action(robot.get_joint_sample()["joint_state"])
         require_start(initial, safety.status(), reference)
         limits = validate_joint_limits(safety.status()["joint_limits"])
+        stack.enter_context(driver_output())
         leaders = {}
-        for side in ("left", "right"):
+        for side, name in (("left", "左"), ("right", "右")):
             leaders[side] = Leader(
                 yaml.safe_load(profile.arms[side].config_path.read_text()),
                 actuated=actuated,
             )
             stack.callback(leaders[side].close)
+            message("主臂", f"{name}主臂已连接（{leader_name(leaders[side].port)}）")
         follower = None
         if actuated:
             # Closed before the leaders (LIFO): stop writing, then torque off.
@@ -878,10 +882,8 @@ def execute(args, config, profile, camera_config, reference, metadata):
                 else "主臂会自动跟随机械臂；接管：按 h 后两个扳机同时扣住 0.5 秒",
                 level="warning",
             )
-        rig = CameraRig(camera_config, depth_enabled=False)
+        rig = start_cameras(CameraRig, camera_config)
         stack.callback(rig.close)
-        rig.start()
-        rig.begin_episode()
         worker = PolicyWorker(policy_factory)
         stack.callback(worker.close)
         agent = None
