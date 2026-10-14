@@ -11,6 +11,7 @@ JAX and runs in its own process. Actor weights travel through an atomically
 replaced ``.npz`` publication that the collector hot-loads at chunk boundaries.
 """
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -238,6 +239,47 @@ def bind_run(run, policy_id):
             f"RLT 运行目录 {run} 已有未绑定模型的训练结果；新模型请用新目录"
         )
     marker.write_text(json.dumps({"policy_id": policy_id}) + "\n")
+
+
+def bind_recordings(run, recordings):
+    """One RLT run reads one recording directory: replay shards are keyed by
+    episode file name, so another directory's episode-000001 would be taken
+    as already processed."""
+    run = Path(run)
+    marker = run / "recordings.json"
+    source = str(Path(recordings).resolve())
+    if marker.exists():
+        bound = json.loads(marker.read_text())["recordings"]
+        if bound != source:
+            raise ValueError(
+                f"RLT 运行目录 {run} 读取的是 {bound}；换录制目录请用新的 --run"
+            )
+        return
+    _atomic_write(marker, (json.dumps({"recordings": source}) + "\n").encode())
+
+
+@contextlib.contextmanager
+def exclusive_learner(run):
+    """Hold RUN/learner.lock for the learner's lifetime (one learner per run)."""
+    import fcntl
+
+    path = Path(run) / "learner.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(
+                f"RLT 运行目录 {run} 已有 learner 在运行；同一目录只能开一个 learner"
+            ) from None
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def bound_policy(run):

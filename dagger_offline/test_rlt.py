@@ -264,3 +264,20 @@ def test_learner_waits_for_the_binding_and_states_name_their_model(tmp_path):
     # A bound run with state but no actor republishes it for its model.
     assert rlt_learn.learn(recordings, run, SMALL, once=True) == 3
     assert rlt.load_actor(run / "actor", SMALL, "m1")[1] == 3
+
+
+def test_one_learner_per_run_and_one_recording_directory(tmp_path):
+    from dagger_offline import rlt_learn
+
+    run = tmp_path / "run"
+    first, second = tmp_path / "a", tmp_path / "b"
+    for d in (first, second):
+        (d / "episodes").mkdir(parents=True)
+    # Unbound model: returns after binding the recordings, without training.
+    assert rlt_learn.learn(first, run, SMALL, once=True) == 0
+    with pytest.raises(ValueError, match="换录制目录"):
+        rlt_learn.learn(second, run, SMALL, once=True)
+    with rlt.exclusive_learner(run):
+        with pytest.raises(RuntimeError, match="已有 learner"):
+            rlt_learn.learn(first, run, SMALL, once=True)
+    assert rlt_learn.learn(first, run, SMALL, once=True) == 0  # lock released

@@ -38,36 +38,33 @@ class TrackingStalled(PolicyTargetRejected):
 JOINT_NAMES = [f"{s}{i}" for s in "LR" for i in (*range(1, 7), "g")]
 
 
-GRIPPER_PICKUP = 0.05  # trigger within this of the follower gripper engages it
-
-
 def relative_controller(qpos):
     from deploy.robot.gym.dagger_rollout import RelativeGelloController
 
     class ContinuousGripper(RelativeGelloController):
-        # Pickup instead of ABC's anchor offset and open snap: the follower
-        # gripper holds until the trigger reaches it, then tracks absolutely,
-        # so the full open/close range stays available after any handover.
+        # Replaces ABC's fixed anchor offset and open snap. At handover the
+        # follower gripper keeps its opening (offset = gripper - trigger);
+        # every trigger movement then bleeds the offset off by the same
+        # amount, so the gripper never jumps, answers in both directions, and
+        # reaches the full 0..1 range once the offset is gone.
         def anchor(self, gello, follower):
             super().anchor(gello, follower)
-            self._pickup = {}
+            self._grip = {}
             for side in ("left", "right"):
                 hold = float(np.clip(self.last[self._slice(side)][6], 0, 1))
                 trigger = float(np.clip(gello[side][6], 0, 1))
-                self._pickup[side] = (
-                    None if abs(trigger - hold) <= GRIPPER_PICKUP
-                    else (hold, np.sign(trigger - hold))
-                )
+                self._grip[side] = [hold - trigger, trigger]
 
         def _gripper(self, side, value):
             value = float(np.clip(value, 0, 1))
-            pending = getattr(self, "_pickup", {}).get(side)
-            if pending is not None:
-                hold, sign = pending
-                if abs(value - hold) > GRIPPER_PICKUP and np.sign(value - hold) == sign:
-                    return hold
-                self._pickup[side] = None
-            return value
+            state = getattr(self, "_grip", {}).get(side)
+            if state is None:
+                return value
+            offset, previous = state
+            shrink = min(abs(offset), abs(value - previous))
+            offset -= np.sign(offset) * shrink
+            state[:] = [offset, value]
+            return float(np.clip(value + offset, 0, 1))
 
     config = SimpleNamespace(
         robots={

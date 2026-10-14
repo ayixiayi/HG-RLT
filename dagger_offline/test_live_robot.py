@@ -348,19 +348,27 @@ def test_official_relative_stationary_anchor_continuous_gripper_and_ack_seed(
     relative.anchor(leader, follower)
     for _ in range(3):
         np.testing.assert_allclose(relative.step(leader), follower, atol=2e-3)
-    # Gripper pickup: the follower holds (0.35 / 0.6) until each trigger
-    # reaches it, then tracks the trigger absolutely in both directions.
+    # Gripper handover: the follower keeps 0.35 / 0.6; trigger motion bleeds
+    # the offset off, so the gripper answers at once and reaches 0..1.
     def grippers(left, right):
         moved = {side: value.copy() for side, value in leader.items()}
         moved["left"][6], moved["right"][6] = left, right
         return relative.step(moved)[[6, 13]]
 
-    np.testing.assert_allclose(grippers(0.1, 0.2), [0.35, 0.6], atol=1e-6)
-    np.testing.assert_allclose(grippers(0.31, 0.58), [0.31, 0.58], atol=1e-6)
-    np.testing.assert_allclose(grippers(0.9, 0.62), [0.9, 0.62], atol=1e-6)
+    np.testing.assert_allclose(grippers(0.1, 0.4), [0.15, 0.6], atol=1e-6)
     np.testing.assert_allclose(grippers(0.0, 1.0), [0.0, 1.0], atol=1e-6)
-    relative.anchor(leader, follower)
-    np.testing.assert_allclose(grippers(0.5, 0.2), [0.5, 0.6], atol=1e-6)  # crossed
+    np.testing.assert_allclose(grippers(0.5, 0.2), [0.5, 0.2], atol=1e-6)
+    # Review case: gripper fully open (or closed), the re-powered trigger
+    # stops inside its span; a full squeeze (or opening) must reach the end.
+    for hold, start, end in ((1.0, 0.93, 0.0), (0.0, 0.07, 1.0)):
+        state = follower.copy()
+        state[[6, 13]] = hold
+        relative.anchor({k: np.r_[v[:6], start] for k, v in leader.items()}, state)
+        path = np.linspace(start, end, 20)
+        out = np.array([grippers(t, t)[0] for t in path])
+        assert abs(out[0] - hold) <= 2 * abs(path[1] - path[0]) + 1e-9  # no jump
+        assert out[-1] == pytest.approx(end)
+        assert np.all(np.diff(out) * np.sign(end - start) >= -1e-9)  # monotone
     acknowledged = follower.copy()
     acknowledged[ARMS] += 0.001
     control = Controller(relative, SimpleNamespace(), now=0)

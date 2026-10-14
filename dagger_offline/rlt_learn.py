@@ -221,6 +221,12 @@ def sync_replay(recordings, replay_dir, config, policy_id=None):
 def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once=False):
     """``config`` overrides RUN/config.json training parameters only."""
     run = Path(run)
+    with rlt.exclusive_learner(run):
+        return _learn(recordings, run, config, min_transitions, poll_s, once)
+
+
+def _learn(recordings, run, config, min_transitions, poll_s, once):
+    rlt.bind_recordings(run, recordings)
     config = rlt.run_config(run, config)
     replay_dir, actor_dir, state_path = (
         run / "replay",
