@@ -244,6 +244,8 @@ def training_config(args, manifest, parent):
         save_interval=args.save_interval,
         fsdp_devices=args.fsdp_devices,
         resume=args.resume,
+        decay_steps=args.decay_steps,
+        keep_period=args.keep_period,
         rl_token=(
             {
                 "alpha": args.rl_alpha,
@@ -351,6 +353,16 @@ def main(argv=None):
             sub.add_argument("--seed", type=int, default=42)
             sub.add_argument("--save-interval", type=int, default=500)
             sub.add_argument("--fsdp-devices", type=int, default=1)
+            sub.add_argument(
+                "--decay-steps",
+                type=int,
+                help="学习率余弦衰减的步数；默认等于 --steps",
+            )
+            sub.add_argument(
+                "--keep-period",
+                type=int,
+                help="另外保留步数为该值整数倍的 checkpoint；默认只留最新",
+            )
             sub.add_argument("--resume", action="store_true")
             sub.add_argument(
                 "--rl-token",

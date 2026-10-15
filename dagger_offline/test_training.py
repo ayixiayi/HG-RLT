@@ -219,6 +219,35 @@ def test_real_openpi_transforms_and_batch(mixture, tmp_path):
     assert all(np.asarray(v).all() for v in observation.image_masks.values())
 
 
+def test_lr_decay_follows_steps_and_periodic_checkpoints_are_optional(
+    mixture, tmp_path
+):
+    pytest.importorskip("openpi")
+    from dagger_offline.training import build_config
+
+    def config(**kwargs):
+        return build_config(
+            mixture,
+            tmp_path,
+            tmp_path / "parent/params",
+            name="dagger_r1",
+            exp_name="cpu",
+            batch_size=2,
+            **kwargs,
+        )
+
+    long = config(steps=20000)
+    assert long.lr_schedule.decay_steps == 20000 and long.keep_period is None
+    assert config().lr_schedule.decay_steps == 2000  # the earlier default
+    tuned = config(steps=20000, decay_steps=15000, keep_period=5000)
+    assert tuned.lr_schedule.decay_steps == 15000 and tuned.keep_period == 5000
+    assert config(steps=50).lr_schedule.decay_steps == 2000  # smoke runs
+    with pytest.raises(ValueError, match="warmup"):
+        config(steps=2000, decay_steps=50)
+    with pytest.raises(ValueError, match="keep period"):
+        config(steps=2000, keep_period=0)
+
+
 def test_resume_step_uses_committed_orbax_checkpoint(tmp_path):
     ocp = pytest.importorskip("orbax.checkpoint")
     from dagger_offline.training import resume_step

@@ -161,9 +161,16 @@ def build_config(
     fsdp_devices=1,
     resume=False,
     rl_token=None,
+    decay_steps=None,
+    keep_period=None,
 ):
     """rl_token: None, or {"alpha", "width", "depth", "heads", "stride"} to add
-    the RLT Stage 1 RL token (alpha 0 trains only the token, VLA frozen)."""
+    the RLT Stage 1 RL token (alpha 0 trains only the token, VLA frozen).
+
+    The cosine learning-rate decay spans ``decay_steps`` (default: ``steps``
+    once it exceeds the warmup),
+    so a longer run does not idle at the floor rate. ``keep_period`` keeps
+    every checkpoint whose step is a multiple of it besides the latest."""
     import dataclasses
 
     from openpi.training.config import AssetsConfig
@@ -190,6 +197,17 @@ def build_config(
         if np.any(np.asarray(norm[key]["q99"]) < norm[key]["q01"]):
             raise ValueError("Invalid parent quantiles")
     base = yam_openpi.make_config(Path(store))
+    warmup = base.lr_schedule.warmup_steps
+    if decay_steps is None:
+        # Short smoke runs keep the base schedule.
+        decay = steps if steps > warmup else base.lr_schedule.decay_steps
+    elif decay_steps <= warmup:
+        raise ValueError("decay steps must exceed the warmup steps")
+    else:
+        decay = decay_steps
+    if keep_period is not None and keep_period < 1:
+        raise ValueError("keep period must be positive")
+    lr_schedule = dataclasses.replace(base.lr_schedule, decay_steps=decay)
     model = dataclasses.replace(base.model, action_horizon=manifest["horizon"])
     loader = CheckpointWeightLoader(str(parent_params))
     freeze = base.freeze_filter
@@ -220,10 +238,12 @@ def build_config(
         ),
         weight_loader=loader,
         num_train_steps=steps,
+        lr_schedule=lr_schedule,
         batch_size=batch_size,
         seed=seed,
         num_workers=0,
         save_interval=save_interval,
+        keep_period=keep_period,
         fsdp_devices=fsdp_devices,
         resume=resume,
     )
