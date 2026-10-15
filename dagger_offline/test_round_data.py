@@ -74,7 +74,9 @@ def test_prepare_exports_pure_segments_and_samples_80_10_10(round_inputs, tmp_pa
 
     records, stats = round_inputs
     output = tmp_path / "round"
-    manifest = prepare_round(records, output, stats, horizon=3, image_size=(16, 16))
+    manifest = prepare_round(
+        records, output, stats, horizon=3, image_size=(16, 16), pre_frames=0
+    )
     assert manifest["complete"]
     assert (output / "norm_stats.json").read_bytes() == stats.read_bytes()
     assert [c["weight"] for c in manifest["mixture"]] == [0.8, 0.1, 0.1]
@@ -120,6 +122,37 @@ def test_prepare_exports_pure_segments_and_samples_80_10_10(round_inputs, tmp_pa
     }.isdisjoint({e["group"] for e in manifest["episodes"] if e["split"] == "val"})
     with pytest.raises(FileExistsError):
         prepare_round(records, output, stats, horizon=3)
+
+
+def test_policy_frames_before_a_takeover_stay_out_of_the_policy_pool(
+    round_inputs, tmp_path
+):
+    from dagger_offline.round_data import PRE_INTERVENTION_FRAMES, prepare_round
+
+    records, stats = round_inputs
+    manifest = prepare_round(
+        records, tmp_path / "pre", stats, horizon=3, image_size=(16, 16)
+    )
+    # Takeovers at frames 20 and 80: policy 0-20 keeps 0-5, policy 65-80 is
+    # entirely within the 15 frames before the second takeover.
+    assert PRE_INTERVENTION_FRAMES == 15
+    autonomous = [
+        tuple(e["frame_range"])
+        for e in manifest["episodes"]
+        if e["component"] == "autonomous" and e["split"] == "train"
+    ]
+    assert autonomous == [(0, 5)]
+    intervention = [
+        tuple(e["frame_range"])
+        for e in manifest["episodes"]
+        if e["component"] == "intervention" and e["split"] == "train"
+    ]
+    assert intervention == [(20, 65), (80, 111)]  # corrections are untouched
+    assert manifest["pre_intervention"] == {
+        "frames": 15,
+        "excluded_policy_frames": manifest["pre_intervention"]["excluded_policy_frames"],
+    }
+    assert manifest["pre_intervention"]["excluded_policy_frames"] >= 2 * 30
 
 
 @pytest.mark.parametrize("violation", ["group", "duplicate"])
@@ -329,11 +362,15 @@ def test_cli_default_30_step_chunks(round_inputs, tmp_path):
             str(output),
             "--norm-stats",
             str(stats),
+            # These synthetic policy runs are 35 frames; keep them whole here.
+            "--pre-intervention-frames",
+            "0",
         ],
         check=True,
     )
     manifest = json.loads((output / "round.json").read_text())
     assert manifest["complete"] and manifest["horizon"] == 30
+    assert manifest["pre_intervention"]["frames"] == 0
     assert {
         name: sum(
             e["windows"]

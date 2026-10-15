@@ -17,6 +17,28 @@ from deploy.recording.export import ExportConfig, write_episode
 
 COMPONENTS = ("previous", "intervention", "autonomous")
 WEIGHTS = (0.8, 0.1, 0.1)
+# Policy frames just before a takeover are the actions the operator stepped in
+# to stop (I3L, arXiv 2610.17748): kept out of the autonomous pool.
+PRE_INTERVENTION_FRAMES = 15  # 0.5 s at 30 Hz
+
+
+def pre_intervention(f, base_ts_ns, frames=PRE_INTERVENTION_FRAMES):
+    """Frames within ``frames`` before each takeover: the operator's h (armed
+    takeover) or any transition into human control."""
+    mask = np.zeros(len(base_ts_ns), bool)
+    if frames <= 0 or "dagger_events" not in f:
+        return mask
+    events = f["dagger_events"]
+    times = events["timestamp_ns"][:]
+    states = np.char.upper(events["controller_state"].asstr()[:].astype(str))
+    reasons = (
+        events["reason"].asstr()[:] if "reason" in events else np.full(len(times), "")
+    )
+    entered = (states == "INTERVENTION") & np.r_[True, states[:-1] != "INTERVENTION"]
+    for mark in times[entered | (reasons == "takeover armed")]:
+        index = int(np.searchsorted(base_ts_ns, mark, side="left"))
+        mask[max(0, index - frames) : index] = True
+    return mask
 
 
 def sha256(path):
@@ -165,6 +187,7 @@ def prepare_round(
     max_age_ms=100,
     image_size=(168, 224),
     current_only=False,
+    pre_frames=PRE_INTERVENTION_FRAMES,
 ):
     """Split BEFORE export; preserve parent stats; refuse missing mixture sources."""
     output = Path(output).resolve()
@@ -183,6 +206,7 @@ def prepare_round(
             raise ValueError("Negative standard deviation")
     groups, hashes, sources, episodes = {}, set(), [], []
     skipped = []
+    pre_excluded = 0
     for record in records:
         path = Path(record["path"]).resolve()
         group, split, role = record["group"], record["split"], record["role"]
@@ -214,13 +238,18 @@ def prepare_round(
         sources.append(source)
         with h5py.File(path) as f:
             synced, _, _, labels, valid, task = read_source(f, role, max_age_ms)
+            pre = pre_intervention(f, synced.base_ts_ns, pre_frames)
+            pre_excluded += int(np.sum(valid & (labels == "POLICY_RUNNING") & pre))
             for label in ("DEMO", "INTERVENTION", "POLICY_RUNNING"):
                 component = (
                     "previous"
                     if role == "previous"
                     else ("intervention" if label == "INTERVENTION" else "autonomous")
                 )
-                for start, end in rio.true_ranges(valid & (labels == label)):
+                usable = valid & (labels == label)
+                if label == "POLICY_RUNNING":
+                    usable &= ~pre
+                for start, end in rio.true_ranges(usable):
                     if end - start < horizon:
                         skipped.append(
                             {
@@ -267,6 +296,10 @@ def prepare_round(
         "sources": sources,
         "episodes": episodes,
         "skipped_segments": skipped,
+        "pre_intervention": {
+            "frames": pre_frames,
+            "excluded_policy_frames": pre_excluded,
+        },
         "norm_sha256": hashlib.sha256(norm_bytes).hexdigest(),
         "mixture": [
             {
@@ -357,6 +390,12 @@ def main():
         action="store_true",
         help="Prepare new rollouts; attach existing LeRobot BC after bridging",
     )
+    parser.add_argument(
+        "--pre-intervention-frames",
+        type=int,
+        default=PRE_INTERVENTION_FRAMES,
+        help="Policy frames before each takeover kept out of the policy pool",
+    )
     args = parser.parse_args()
     records = json.loads(args.records.read_text())
     for record in records:
@@ -367,6 +406,7 @@ def main():
         args.norm_stats,
         horizon=args.horizon,
         current_only=args.current_only,
+        pre_frames=args.pre_intervention_frames,
     )
     print(
         json.dumps(

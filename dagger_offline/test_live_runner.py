@@ -1466,7 +1466,7 @@ def test_record_export_lerobot_and_real_openpi_training_batch(tmp_path, monkeypa
         )
     )
     root = tmp_path / "round"
-    manifest = prepare_round(records, root, stats, image_size=(24, 32))
+    manifest = prepare_round(records, root, stats, image_size=(24, 32), pre_frames=0)
     counts = {
         c: sum(
             e["windows"]
@@ -1477,6 +1477,17 @@ def test_record_export_lerobot_and_real_openpi_training_batch(tmp_path, monkeypa
     }
     # Continuous policy runs: one handback yields several 30-frame windows.
     assert counts == {"previous": 14, "intervention": 6, "autonomous": 8}
+    # Default pre-intervention window: the run before the takeover (tick 38)
+    # loses its last 15 frames and with them all of its 5 windows.
+    trimmed = prepare_round(records, tmp_path / "round-pre", stats, image_size=(24, 32))
+    assert {
+        c: sum(
+            e["windows"]
+            for e in trimmed["episodes"]
+            if e["component"] == c and e["split"] == "train"
+        )
+        for c in ("previous", "intervention", "autonomous")
+    } == {"previous": 9, "intervention": 6, "autonomous": 3}
     # Every exported slice comes from real loop output and a single interval;
     # HOLD observations are retained in HDF5, never stitched into a chunk.
     for e in manifest["episodes"]:
@@ -1614,9 +1625,11 @@ def test_record_export_lerobot_and_real_openpi_training_batch(tmp_path, monkeypa
         "val_fraction": 0.2,
         "seed": 42,
     }
+    # prepare-data applies the default pre-intervention window to the new
+    # rollouts: the policy run before the takeover contributes no windows.
     assert [
         b - a for a, b in WindowDataset(prepared_manifest, "train").component_ranges
-    ] == [14, 6, 8]
+    ] == [14, 6, 3]
     with pytest.raises(FileExistsError):
         workflow(prepare_args)
     leaked = tmp_path / "leaked"
@@ -1959,9 +1972,10 @@ def test_record_export_lerobot_and_real_openpi_training_batch(tmp_path, monkeypa
         ]
     )
     assert (next_manifest.parent / "norm_stats.json").read_bytes() == stats.read_bytes()
+    # 80% pool: BC 14 + round-one human 6 + policy 3; new round 6 / 3.
     assert [
         b - a for a, b in WindowDataset(next_manifest, "train").component_ranges
-    ] == [28, 6, 8]
+    ] == [23, 6, 3]
     next_archive = workflow(
         [
             "pack-training",

@@ -207,6 +207,11 @@ def prepare_data(args, parent):
                 raise FileNotFoundError(f"缺少旧 BC 划分及来源信息：{directory}")
     message("1/3 · 片段", "筛选有效接管/策略片段；固定 30 帧窗口，不跨 HOLD 或时间断点")
     prepare_round(records, output / "abc", stats, current_only=True)
+    pre = json.loads((output / "abc/round.json").read_text())["pre_intervention"]
+    message(
+        "接管前窗口",
+        f"每次接管前 {pre['frames']} 帧不进策略池；本轮去掉 {pre['excluded_policy_frames']} 帧",
+    )
     message("2/3 · 格式", "转为 LeRobot v2.1；保留三路图像、14 维状态与已确认动作")
     convert_round(output / "abc/round.json", output / "lerobot")
     manifest = output / "lerobot/combined.json"

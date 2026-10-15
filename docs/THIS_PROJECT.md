@@ -88,7 +88,7 @@ cd "$HOME/Project/HG-RLT"
 文件自动编号保存在 `data/recordings/heavier-r1/episodes/`，重复同一命令接着编号。
 `records.json` 自动更新，只收录完整、可用且标为成功或失败的条目。
 弃用和未完成的条目（连同 `.prepare.jsonl`）自动移到 `data/recordings/heavier-r1/trash/`，`episodes/` 里只留正常标记的录制；编号不复用。
-人工接管和策略执行各尽量保持超过 1 秒（30 帧）的连续片段，训练窗口不跨 HOLD 和接管边界。
+人工接管和策略执行各尽量保持超过 1 秒（30 帧）的连续片段，训练窗口不跨 HOLD 和接管边界；每次接管前 15 帧（0.5 秒）的策略动作不进策略池。
 
 实验结束按现场流程停机、断电；HOLD 是带电保持。
 
