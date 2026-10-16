@@ -47,7 +47,11 @@ TRANSITION_FIELDS = (
     "next_committed",
     "next_ref",
     "intervention",
+    "skip",  # leading steps of `action` that were already committed
+    "next_skip",
 )
+# Bumped when the transition layout changes: older shards are refused.
+REPLAY_FORMAT = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,8 +112,8 @@ class RLTConfig:
     )
     REPLAY_FIELDS = ("token_dim", "chunk", "lead", "action_scale", "gamma")
 
-    def _hash(self, fields):
-        values = {k: getattr(self, k) for k in fields}
+    def _hash(self, fields, **extra):
+        values = {k: getattr(self, k) for k in fields} | extra
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[
             :16
         ]
@@ -118,7 +122,7 @@ class RLTConfig:
         return self._hash(self.ACTOR_FIELDS)
 
     def replay_digest(self):
-        return self._hash(self.REPLAY_FIELDS)
+        return self._hash(self.REPLAY_FIELDS, replay_format=REPLAY_FORMAT)
 
     def digest(self):
         return self._hash(tuple(f.name for f in dataclasses.fields(self)))
@@ -220,11 +224,26 @@ def expand_knots(knots, config, xp=np):
     return steps.reshape(*steps.shape[:-2], config.action_dim)
 
 
-def actor_mean(params, state, ref, config, xp=np):
-    """Normalized residual chunk; the reference is an input AND the offset,
-    and the actor's correction to it is linear over the chunk."""
-    x = xp.concatenate([state, ref], axis=-1)
-    return xp.clip(ref + expand_knots(_forward(params, x, xp), config, xp), -1.0, 1.0)
+def actor_mean(params, state, ref, config, xp=np, ref_input=None):
+    """Normalized residual chunk: ã plus the actor's correction, linear over
+    the chunk and bounded to +-1. ``ref_input`` is what the network sees of ã
+    (reference dropout hides it there); ã itself stays the offset, and is
+    never clipped (a gripper target may lie more than 1 unit from qpos)."""
+    seen = ref if ref_input is None else ref_input
+    x = xp.concatenate([state, seen], axis=-1)
+    correction = expand_knots(_forward(params, x, xp), config, xp)
+    return ref + xp.clip(correction, -1.0, 1.0)
+
+
+def with_prefix(action, prefix, skip, config, xp=np):
+    """Replace the first ``skip`` steps of flat chunks by ``prefix`` (flat,
+    at least that long): steps already committed are not the actor's choice."""
+    width = min(prefix.shape[-1], config.action_dim)
+    tail = xp.zeros((*prefix.shape[:-1], config.action_dim - width), action.dtype)
+    prefix = xp.concatenate([prefix[..., :width], tail], -1)
+    step = xp.arange(config.action_dim) // JOINTS
+    keep = step >= xp.reshape(skip, (-1, 1))
+    return xp.where(keep, action, prefix)
 
 
 class Actor:
@@ -347,15 +366,25 @@ def bind_recordings(run, recordings):
     run = Path(run)
     marker = run / "recordings.json"
     source = str(Path(recordings).resolve())
+    if bound_recordings(run) is None:
+        run.mkdir(parents=True, exist_ok=True)
+        # Exclusive first binding: a collector and a learner starting at once
+        # with different directories must not both win.
+        with tempfile.NamedTemporaryFile(dir=run, suffix=".tmp", delete=False) as f:
+            f.write((json.dumps({"recordings": source}) + "\n").encode())
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(f.name, marker)
+        except FileExistsError:
+            pass  # someone bound first: checked below
+        finally:
+            os.unlink(f.name)
     bound = bound_recordings(run)
-    if bound is not None:
-        if bound != source:
-            raise ValueError(
-                f"RLT 运行目录 {run} 读取的是 {bound}；换录制目录请用新的 --run"
-            )
-        return
-    run.mkdir(parents=True, exist_ok=True)
-    _atomic_write(marker, (json.dumps({"recordings": source}) + "\n").encode())
+    if bound != source:
+        raise ValueError(
+            f"RLT 运行目录 {run} 读取的是 {bound}；换录制目录请用新的 --run"
+        )
 
 
 @contextlib.contextmanager
@@ -596,11 +625,11 @@ class Learner:
                 -cfg.noise_clip,
                 cfg.noise_clip,
             )
-            next_action = jnp.clip(
-                actor_mean(target_actor, next_state, batch["next_ref"], cfg, jnp)
-                + expand_knots(noise, cfg, jnp),
-                -1,
-                1,
+            next_action = actor_mean(
+                target_actor, next_state, batch["next_ref"], cfg, jnp
+            ) + expand_knots(noise, cfg, jnp)
+            next_action = with_prefix(
+                next_action, batch["next_committed"], batch["next_skip"], cfg, jnp
             )
             target_q = jnp.minimum(
                 self._q(target_critics[0], next_state, next_action),
@@ -633,8 +662,12 @@ class Learner:
                 [batch["token"], batch["proprio"], batch["committed"]], -1
             )
             keep = jax.random.bernoulli(key, 1 - cfg.ref_dropout, (state.shape[0], 1))
-            ref_in = batch["ref"] * keep
-            action = actor_mean(actor, state, ref_in, cfg, jnp)
+            action = actor_mean(
+                actor, state, batch["ref"], cfg, jnp, ref_input=batch["ref"] * keep
+            )
+            # The committed steps ran whatever the actor says: Q and BC see them
+            # as executed, so no gradient asks the actor to change them.
+            action = with_prefix(action, batch["action"], batch["skip"], cfg, jnp)
             q = self._q(critic, state, action)
             bc = jnp.sum(jnp.square(action - batch["ref"]), -1)
             # TD3+BC scaling: beta stays meaningful whatever the reward scale.

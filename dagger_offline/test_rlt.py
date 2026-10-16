@@ -110,6 +110,89 @@ def test_actor_correction_is_linear_over_the_chunk(tmp_path):
         rlt.run_config(old)
 
 
+
+def test_reference_is_never_clipped_and_committed_steps_are_kept():
+    cfg = rlt.RLTConfig(token_dim=8, hidden=32)
+    params = rlt.init_actor(cfg)  # near-zero correction
+    state = np.zeros((1, cfg.state_dim), np.float32)
+    # Gripper target 1 from position 0 is 2 normalized units away.
+    ref = np.zeros((1, cfg.action_dim), np.float32)
+    ref[0, 6::14] = 2.0
+    mean = rlt.actor_mean(params, state, ref, cfg)
+    np.testing.assert_allclose(mean, ref, atol=5e-3)
+    # Reference dropout hides ã from the network only; it stays the offset.
+    hidden = rlt.actor_mean(params, state, ref, cfg, ref_input=np.zeros_like(ref))
+    np.testing.assert_allclose(hidden, ref, atol=5e-3)
+    big = {k: v * 1e4 for k, v in params.items()}
+    assert np.abs(rlt.actor_mean(big, state + 1, ref, cfg) - ref).max() <= 1 + 1e-6
+    # The first `skip` steps come from the prefix, the rest from the actor.
+    action = np.ones((2, cfg.action_dim))
+    prefix = np.full((2, cfg.committed_dim), 7.0)
+    out = rlt.with_prefix(action, prefix, np.array([0, 3]), cfg)
+    np.testing.assert_array_equal(out[0], 1)
+    np.testing.assert_array_equal(out[1, : 3 * 14], 7)
+    np.testing.assert_array_equal(out[1, 3 * 14 :], 1)
+
+
+def test_actor_gets_no_gradient_from_committed_steps():
+    pytest.importorskip("jax")
+    cfg = dataclasses.replace(SMALL, ref_dropout=0.0)
+    rng = np.random.default_rng(0)
+    rows = [_row(rng, cfg, skip=float(cfg.chunk)) for _ in range(64)]
+    batch = {k: np.stack([r[k] for r in rows]).astype(np.float32) for k in rows[0]}
+    learner = rlt.Learner(cfg, seed=0)
+    import jax
+
+    before = jax.tree.map(np.asarray, learner.actor)
+    actor, *_ = learner._actor_step(
+        learner.actor, learner.actor_state, learner.critics[0], batch, jax.random.key(0)
+    )
+    # Every step was committed: nothing the actor outputs reaches Q or BC.
+    for k in before:
+        np.testing.assert_array_equal(np.asarray(actor[k]), before[k])
+
+
+def test_first_recordings_binding_is_exclusive(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    rlt.bind_recordings(run, tmp_path / "a")
+    # A second starter that looked before the first one wrote must still lose.
+    real = rlt.bound_recordings
+    calls = []
+
+    def stale(path):
+        calls.append(path)
+        return None if len(calls) == 1 else real(path)
+
+    monkeypatch.setattr(rlt, "bound_recordings", stale)
+    with pytest.raises(ValueError, match="换录制目录"):
+        rlt.bind_recordings(run, tmp_path / "b")
+    monkeypatch.undo()
+    assert rlt.bound_recordings(run) == str((tmp_path / "a").resolve())
+    assert [p.name for p in run.iterdir()] == ["recordings.json"]
+
+
+def test_old_synchronous_recordings_are_skipped_not_fatal(tmp_path, monkeypatch):
+    from dagger_offline import rlt_learn
+
+    recordings, replay = tmp_path / "rec", tmp_path / "replay"
+    (recordings / "episodes").mkdir(parents=True)
+    for n in (1, 2):
+        (recordings / "episodes" / f"episode-00000{n}.h5").touch()
+    rng = np.random.default_rng(0)
+
+    def transitions(path, config, policy_id=None):
+        if path.stem.endswith("1"):
+            raise rlt_learn.SynchronousRecording("old")
+        return [_row(rng, config)]
+
+    monkeypatch.setattr(rlt_learn, "episode_transitions", transitions)
+    assert rlt_learn.sync_replay(recordings, replay, SMALL) == 1
+    assert sorted(p.name for p in replay.iterdir()) == [
+        "episode-000001.npz.none",
+        "episode-000002.npz",
+    ]
+
+
 def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
     watcher = rlt.ActorWatcher(tmp_path, SMALL)
     assert watcher.poll() is None
@@ -142,6 +225,8 @@ def _row(rng, cfg, **override):
         "next_committed": np.zeros(cfg.committed_dim),
         "next_ref": np.zeros(cfg.action_dim),
         "intervention": 0.0,
+        "skip": 0.0,
+        "next_skip": 0.0,
     }
     row.update(override)
     return row
@@ -241,6 +326,7 @@ def _episode(idle_last=False, **extra):
         "token": np.zeros((n, SMALL.token_dim), np.float32),
         "proprio": np.zeros((n, rlt.PROPRIO), np.float32),
         "committed": np.full((n, SMALL.lead, 14), 0.05),
+        "skip": np.array([0] + [SMALL.lead] * (n - 1)),
         "reference": np.zeros((n, SMALL.chunk, 14)),
         "planned": np.zeros((n, SMALL.chunk, 14)),
     }
@@ -270,6 +356,9 @@ def test_transitions_tile_observations_and_discount_elapsed_steps():
 
     rows = rlt_learn.chain_transitions(*_episode(), SMALL)
     assert [r["done"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
+    # Committed steps of each decision and of its successor travel along.
+    assert [r["skip"] for r in rows] == [0, 1, 1, 1]
+    assert [r["next_skip"] for r in rows] == [1, 1, 1, 0]
     assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
     # Decision 0 observed at 100, next state observed at 300: 20 rows elapse.
     assert rows[0]["discount"] == pytest.approx(SMALL.gamma**20)

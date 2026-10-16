@@ -36,6 +36,10 @@ from dagger_offline import rlt
 from dagger_offline.console import message
 
 
+class SynchronousRecording(ValueError):
+    """RL decisions recorded before back-to-back chunks (no committed steps)."""
+
+
 def read_episode(path):
     """Shared HDF5 fields, or None while not complete and labelled."""
     with h5py.File(path, "r") as f:
@@ -99,8 +103,8 @@ def chain_transitions(episode, decisions, config):
     d = decisions
     count = len(d["accepted_ns"])
     never = 2**63
-    if "committed" not in d:
-        raise ValueError(
+    if "committed" not in d or "skip" not in d:
+        raise SynchronousRecording(
             "RL decisions without committed steps (synchronous RLT recording); "
             "use a new --rlt run"
         )
@@ -147,7 +151,10 @@ def chain_transitions(episode, decisions, config):
         planned = np.array(d["planned"][i], dtype=np.float64)
         planned[: len(executed_steps)] = executed_steps
         committed = rlt.committed_residual(d["committed"][i], qpos, config)
+        skip = min(int(d["skip"][i]), len(executed_steps))
+        next_skip = 0
         if chained:
+            next_skip = min(int(d["skip"][j]), config.lead)
             next_qpos = d["proprio"][j][: rlt.JOINTS]
             next_ref = rlt.to_residual(d["reference"][j], next_qpos, config)
             next_token, next_proprio = d["token"][j], d["proprio"][j]
@@ -180,6 +187,8 @@ def chain_transitions(episode, decisions, config):
                 "next_committed": next_committed,
                 "next_ref": next_ref,
                 "intervention": 0.0,
+                "skip": skip,
+                "next_skip": next_skip,
             }
         )
     return rows
@@ -216,6 +225,15 @@ def sync_replay(recordings, replay_dir, config, policy_id=None):
             rows = episode_transitions(path, config, policy_id)
         except OSError:
             continue  # still being written or held by the collector
+        except SynchronousRecording:
+            # An old recording kept in the directory: no usable transitions,
+            # but newer episodes after it must still be learned from.
+            message(
+                "RLT learner",
+                f"{path.name} 是旧版同步 RL 录制（没有 committed），跳过",
+                level="warning",
+            )
+            rows = []
         if rows is None:
             continue  # not finished/labelled yet: look again next cycle
         writer = rlt.ReplayWriter(replay_dir, config, path.stem)
