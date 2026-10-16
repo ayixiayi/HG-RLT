@@ -361,14 +361,17 @@ class EpisodeRecorder:
         reference = np.asarray(reference, dtype=np.float64)
         actor = np.asarray(actor, dtype=np.float64)
         committed = np.asarray(committed, dtype=np.float64)
+        skip_value = np.asarray(skip)
         if (
             committed.ndim != 2
             or committed.shape[1] != 14
             or not np.isfinite(committed).all()
-            or type(skip) is not int
-            or skip < 0
+            or skip_value.ndim != 0
+            or not np.issubdtype(skip_value.dtype, np.integer)
+            or int(skip_value) < 0
         ):
             raise ValueError("Invalid RL decision committed steps")
+        skip = int(skip_value)
         if (
             token.ndim != 1
             or proprio.shape != (28,)
@@ -599,7 +602,7 @@ class AsyncEpisodeRecorder:
             observed_ns,
             accepted_ns,
             **{
-                k: np.array(v, copy=True) if k != "actor_version" else v
+                k: np.array(v, copy=True) if k not in ("actor_version", "skip") else v
                 for k, v in fields.items()
             },
         )

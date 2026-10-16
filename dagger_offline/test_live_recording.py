@@ -285,6 +285,36 @@ def test_async_sample_returns_before_storage_and_freezes_all_inputs(tmp_path):
             )
 
 
+
+@pytest.mark.parametrize("writer_class", [EpisodeRecorder, AsyncEpisodeRecorder])
+def test_rl_decision_keeps_committed_steps_and_skip(tmp_path, writer_class):
+    # The controller hands over numpy integers; the async copy must not turn
+    # skip into an array the validator rejects.
+    path = tmp_path / "rl.h5"
+    committed = np.tile(Q, (4, 1))
+    fields = dict(
+        token=np.ones(8),
+        proprio=np.zeros(28),
+        reference=np.tile(A, (10, 1)),
+        actor=np.tile(A, (10, 1)),
+        actor_version=3,
+        committed=committed,
+    )
+    with recorder(path, writer_class) as r:
+        populate(r)
+        r.rl_decision(TIMES[1], TIMES[2], skip=np.int64(2), **fields)
+        r.rl_decision(TIMES[3], TIMES[4], skip=0, **fields)
+        committed[:] = -1
+        r.finish(keep=True)
+    with h5py.File(path) as f:
+        d = f["rl_decisions"]
+        assert d["skip"][:].tolist() == [2, 0]
+        np.testing.assert_array_equal(d["committed"][:], np.tile(Q, (2, 4, 1)))
+        assert d["actor_version"][:].tolist() == [3, 3]
+    with recorder(tmp_path / "bad.h5") as r, pytest.raises(ValueError):
+        r.rl_decision(TIMES[1], TIMES[2], skip=True, **fields)
+
+
 @pytest.mark.parametrize("failure", ["disk", "invalid", "overflow"])
 def test_async_failure_is_sticky_and_cannot_publish(tmp_path, failure):
     entered, resume = threading.Event(), threading.Event()
