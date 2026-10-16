@@ -2196,6 +2196,36 @@ def test_rlt_episode_replay_learner_and_hot_reload(tmp_path):
     assert rows[-1]["done"] == 1.0 and rows[-1]["reward"] == 0.0
 
 
+def test_policy_warm_up_waits_long_once_and_always_closes():
+    calls = []
+
+    class Client:
+        def __init__(self, timeout_s):
+            calls.append(("open", timeout_s))
+
+        def reset(self):
+            calls.append("reset")
+
+        def infer_chunk(self, observation):
+            calls.append(("infer", observation))
+            if observation == "broken":
+                raise TimeoutError("compile took too long")
+
+        def close(self):
+            calls.append("close")
+
+    ticks = iter([10.0, 23.5])
+    elapsed = runner.warm_up_policy(
+        lambda timeout_s: Client(timeout_s), lambda: "obs", clock=lambda: next(ticks)
+    )
+    assert elapsed == 13.5
+    assert calls == [("open", 60.0), "reset", ("infer", "obs"), "close"]
+    calls.clear()
+    with pytest.raises(TimeoutError):
+        runner.warm_up_policy(lambda timeout_s: Client(timeout_s), lambda: "broken")
+    assert calls[-1] == "close"
+
+
 def test_r_without_rlt_is_ignored_and_rl_needs_token(tmp_path):
     from dagger_offline import rlt
     from dagger_offline.live_control import Controller

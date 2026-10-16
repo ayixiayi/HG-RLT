@@ -818,6 +818,27 @@ def prepare_start(args, profile, reference):
         message("归零完成", "反馈已到位，已确认 HOLD；可启动新记录。", level="success")
 
 
+# A model server's first inference compiles (often well over the 2 s control
+# deadline); every episode first runs one request with this timeout.
+POLICY_WARMUP_TIMEOUT_S = 60.0
+
+
+def warm_up_policy(factory, observe, *, timeout_s=POLICY_WARMUP_TIMEOUT_S, clock=time.monotonic):
+    """One inference on the live observation before control starts: the robot
+    stays in HOLD, nothing is sent or recorded, the connection is closed."""
+    message("模型", "预热推理中；服务刚启动时首次推理需要编译，可能要几十秒")
+    client = factory(timeout_s=timeout_s)
+    try:
+        client.reset()
+        start = clock()
+        client.infer_chunk(observe())
+        elapsed = clock() - start
+    finally:
+        client.close()
+    message("模型", f"推理已就绪（本次 {elapsed:.1f} s）", level="success")
+    return elapsed
+
+
 def execute(args, config, profile, camera_config, reference, metadata):
     if not sys.stdin.isatty():
         raise RuntimeError(
@@ -867,16 +888,20 @@ def execute(args, config, profile, camera_config, reference, metadata):
     if "sealed_policy_id" in metadata:
         from dagger_offline.deployment import SealedPolicyClient
 
-        def policy_factory():
-            return SealedPolicyClient(url, metadata["sealed_policy_id"])
+        def policy_factory(timeout_s=2.0):
+            return SealedPolicyClient(
+                url, metadata["sealed_policy_id"], timeout_s=timeout_s
+            )
 
         # Identity-only probe: no reset/inference, no recording/device/session.
         # The worker connects separately and rechecks identity on every reply.
         policy_factory().close()
     else:
 
-        def policy_factory():
-            return Pi05PolicyClient(url, request_timeout_s=2, transport_timeout_s=2)
+        def policy_factory(timeout_s=2):
+            return Pi05PolicyClient(
+                url, request_timeout_s=timeout_s, transport_timeout_s=timeout_s
+            )
 
     with ExitStack() as stack:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -930,6 +955,19 @@ def execute(args, config, profile, camera_config, reference, metadata):
             )
         rig = start_cameras(CameraRig, camera_config)
         stack.callback(rig.close)
+        warm_up_policy(
+            policy_factory,
+            lambda: build_pi05_observation(
+                unpack_action(robot.get_joint_sample()["joint_state"]),
+                {
+                    name: frame.rgb.copy()
+                    for name, frame in wait_for_camera_bundle(
+                        rig, timeout_s=2.0, poll_interval_s=0.002
+                    ).frames.items()
+                },
+                config["instruction"],
+            ),
+        )
         worker = PolicyWorker(policy_factory)
         stack.callback(worker.close)
         agent = None
