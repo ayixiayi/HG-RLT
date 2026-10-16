@@ -94,6 +94,9 @@ case "$command" in
   serve-round)
     export CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false
     unset JAX_PLATFORMS
+    # Pinned OpenPI imports lerobot.common: the vendored LeRobot it pins comes
+    # before the model env's site-packages copy.
+    export PYTHONPATH="$H:$OPENPI:$OPENPI/src:$OPENPI/packages/openpi-client/src:$LEROBOT:$PYTHONPATH"
     exec "$MODEL" -m dagger_offline.deployment serve --rhos-root "$R" \
       --openpi "$OPENPI" "$@"
     ;;
