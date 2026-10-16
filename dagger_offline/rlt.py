@@ -55,12 +55,17 @@ class RLTConfig:
     token_dim: int = 2048
     chunk: int = 10  # C: 0.33 s at 30 Hz
     lead: int = 4  # request the next decision this many steps before a chunk ends
+    # The actor's correction to ã is linear in time over the chunk: one offset
+    # per joint at each of `knots` evenly spaced steps, interpolated between.
+    # Per-step outputs fit noise in the critic and made the arm twitch.
+    knots: int = 2
     hidden: int = 256
     layers: int = 2
     gamma: float = 0.99  # per control step; a transition discounts gamma**C
-    # BC anchor toward the reference / human chunk, on the per-dimension mean
-    # squared residual (dimension-independent); Q is normalized by mean |Q|.
-    beta: float = 5.0
+    # BC anchor toward the reference / human chunk: beta * ||a - ã||^2 summed
+    # over the chunk (as in RLT); Q is normalized by mean |Q|. A per-dimension
+    # mean made the anchor 140x weaker and the actor ran to the clip.
+    beta: float = 2.0
     actor_std: float = 0.05  # exploration target per decision, normalized units
     action_scale: float = 0.5  # rad per normalized unit of residual
     ref_dropout: float = 0.5
@@ -87,10 +92,20 @@ class RLTConfig:
     def __post_init__(self):
         if not 0 <= self.lead < self.chunk:
             raise ValueError("lead must be 0 .. chunk-1")
+        if not 2 <= self.knots <= self.chunk:
+            raise ValueError("knots must be 2 .. chunk")
 
     # Fields that change what a published actor means / what replay contains.
     # Training hyperparameters (lr, beta, utd, ...) may change between runs.
-    ACTOR_FIELDS = ("token_dim", "chunk", "lead", "hidden", "layers", "action_scale")
+    ACTOR_FIELDS = (
+        "token_dim",
+        "chunk",
+        "lead",
+        "knots",
+        "hidden",
+        "layers",
+        "action_scale",
+    )
     REPLAY_FIELDS = ("token_dim", "chunk", "lead", "action_scale", "gamma")
 
     def _hash(self, fields):
@@ -168,10 +183,17 @@ def _mlp_init(rng, sizes):
     return params
 
 
+def knot_basis(config):
+    """(chunk, knots) linear-interpolation weights from knot offsets to steps."""
+    position = np.linspace(0.0, config.knots - 1, config.chunk)
+    basis = np.maximum(0.0, 1.0 - np.abs(position[:, None] - np.arange(config.knots)))
+    return basis.astype(np.float32)
+
+
 def init_actor(config, seed=0):
     rng = np.random.default_rng(seed)
     sizes = [config.state_dim + config.action_dim]
-    sizes += [config.hidden] * config.layers + [config.action_dim]
+    sizes += [config.hidden] * config.layers + [config.knots * JOINTS]
     return _mlp_init(rng, sizes)
 
 
@@ -191,10 +213,18 @@ def _forward(params, x, xp):
     return x
 
 
-def actor_mean(params, state, ref, xp=np):
-    """Normalized residual chunk; the reference is an input AND the offset."""
+def expand_knots(knots, config, xp=np):
+    """(..., knots*14) offsets -> (..., chunk*14) flat per-step offsets."""
+    knots = knots.reshape(*knots.shape[:-1], config.knots, JOINTS)
+    steps = xp.einsum("ck,...kj->...cj", xp.asarray(knot_basis(config)), knots)
+    return steps.reshape(*steps.shape[:-2], config.action_dim)
+
+
+def actor_mean(params, state, ref, config, xp=np):
+    """Normalized residual chunk; the reference is an input AND the offset,
+    and the actor's correction to it is linear over the chunk."""
     x = xp.concatenate([state, ref], axis=-1)
-    return xp.clip(ref + _forward(params, x, xp), -1.0, 1.0)
+    return xp.clip(ref + expand_knots(_forward(params, x, xp), config, xp), -1.0, 1.0)
 
 
 class Actor:
@@ -216,7 +246,7 @@ class Actor:
         if state.shape != (cfg.state_dim,):
             raise ValueError("RL token / proprio size does not match the actor")
         ref = to_residual(ref_chunk, qpos, cfg)
-        mean = actor_mean(self.params, state[None], ref[None])[0]
+        mean = actor_mean(self.params, state[None], ref[None], cfg)[0]
         if not np.isfinite(mean).all():
             raise ValueError("Actor produced non-finite actions")
         return from_residual(mean, qpos, cfg), mean.astype(np.float32)
@@ -377,7 +407,13 @@ def run_config(run, override=None):
     """
     path = Path(run) / "config.json"
     if path.exists():
-        stored = RLTConfig(**json.loads(path.read_text()))
+        values = json.loads(path.read_text())
+        if "knots" not in values:
+            raise ValueError(
+                f"{run} 是旧版逐步输出的 RLT actor（会抽搐）；请用新的 RLT 目录，"
+                "已录的录制目录可以继续用"
+            )
+        stored = RLTConfig(**values)
         if override is None or override == stored:
             return stored
         if (
@@ -553,13 +589,16 @@ class Learner:
             next_state = jnp.concatenate(
                 [batch["next_token"], batch["next_proprio"], batch["next_committed"]], -1
             )
+            # Target smoothing noise in the actor's own (knot) space.
+            knots = (batch["action"].shape[0], cfg.knots * JOINTS)
             noise = jnp.clip(
-                cfg.target_noise * jax.random.normal(key, batch["action"].shape),
+                cfg.target_noise * jax.random.normal(key, knots),
                 -cfg.noise_clip,
                 cfg.noise_clip,
             )
             next_action = jnp.clip(
-                actor_mean(target_actor, next_state, batch["next_ref"], jnp) + noise,
+                actor_mean(target_actor, next_state, batch["next_ref"], cfg, jnp)
+                + expand_knots(noise, cfg, jnp),
                 -1,
                 1,
             )
@@ -595,9 +634,9 @@ class Learner:
             )
             keep = jax.random.bernoulli(key, 1 - cfg.ref_dropout, (state.shape[0], 1))
             ref_in = batch["ref"] * keep
-            action = actor_mean(actor, state, ref_in, jnp)
+            action = actor_mean(actor, state, ref_in, cfg, jnp)
             q = self._q(critic, state, action)
-            bc = jnp.mean(jnp.square(action - batch["ref"]), -1)
+            bc = jnp.sum(jnp.square(action - batch["ref"]), -1)
             # TD3+BC scaling: beta stays meaningful whatever the reward scale.
             scale = jax.lax.stop_gradient(jnp.mean(jnp.abs(q))) + 1e-6
             return jnp.mean(-q / scale + cfg.beta * bc), (jnp.mean(q), jnp.mean(bc))

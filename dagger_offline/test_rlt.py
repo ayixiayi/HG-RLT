@@ -1,5 +1,7 @@
 """RLT online core: NumPy actor, publication, replay, and the JAX TD3 learner."""
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -80,6 +82,34 @@ def test_recordings_binding_is_shared_by_collector_and_learner(tmp_path):
         rlt.bind_recordings(run, tmp_path / "eval" / "a")
 
 
+
+def test_actor_correction_is_linear_over_the_chunk(tmp_path):
+    cfg = rlt.RLTConfig(token_dim=8, hidden=32)
+    rng = np.random.default_rng(0)
+    params = {k: rng.standard_normal(v.shape).astype(np.float32) * 0.05
+              for k, v in rlt.init_actor(cfg).items()}
+    assert params[f"w{cfg.layers}"].shape[1] == cfg.knots * 14
+    actor = rlt.Actor(cfg, params)
+    qpos = np.zeros(14)
+    ref = qpos[None] + 0.01 * np.sin(np.arange(cfg.chunk))[:, None]
+    held = rlt.pad_committed([], qpos, cfg)
+    chunk, _ = actor.act(np.ones(8), rlt.proprio(qpos, qpos), held, ref, qpos)
+    correction = chunk - ref
+    assert np.abs(correction).max() > 1e-3  # the actor does correct ã
+    np.testing.assert_allclose(np.diff(correction, 2, axis=0), 0, atol=1e-6)
+    basis = rlt.knot_basis(cfg)
+    np.testing.assert_allclose(basis.sum(1), 1, atol=1e-6)
+    assert basis[0, 0] == 1 and basis[-1, -1] == 1
+    with pytest.raises(ValueError, match="knots"):
+        rlt.RLTConfig(chunk=4, lead=1, knots=5)
+    # A run made by the per-step actor is refused, not silently reshaped.
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "config.json").write_text('{"token_dim": 8, "chunk": 10, "lead": 4}')
+    with pytest.raises(ValueError, match="旧版"):
+        rlt.run_config(old)
+
+
 def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
     watcher = rlt.ActorWatcher(tmp_path, SMALL)
     assert watcher.poll() is None
@@ -155,10 +185,13 @@ def test_td3_learner_improves_on_the_reference(reward_scale):
         reward = -reward_scale * np.sum(np.square(action - best(token)))
         rows.append(_row(rng, SMALL, token=token, action=action, reward=reward))
     replay = {k: np.stack([r[k] for r in rows]).astype(np.float32) for k in rows[0]}
-    learner = rlt.Learner(SMALL, seed=0)
+    # A weak anchor: this checks that TD3 finds a better chunk, not how far
+    # the production anchor lets it go.
+    loose = dataclasses.replace(SMALL, beta=0.05)
+    learner = rlt.Learner(loose, seed=0)
     log = learner.train(replay, steps=1500, rng=np.random.default_rng(1))
     assert np.isfinite(list(log.values())).all()
-    actor = rlt.Actor(SMALL, learner.actor_numpy())
+    actor = rlt.Actor(loose, learner.actor_numpy())
     tokens = rng.standard_normal((200, SMALL.token_dim))
     zero = np.zeros(14)
 
@@ -212,6 +245,24 @@ def _episode(idle_last=False, **extra):
         "planned": np.zeros((n, SMALL.chunk, 14)),
     }
     return episode, decisions
+
+
+
+def test_rl_run_stopped_by_the_safety_layer_is_not_credited():
+    from dagger_offline import rlt_learn
+
+    episode, decisions = _episode(
+        event_ns=np.array([600, 950]),
+        event_reason=np.array(
+            ["Policy rejected; explicit h/p required: Unsafe target", "finish"]
+        ),
+        event_state=np.array(["HOLD", "HOLD"]),
+    )
+    rows = rlt_learn.chain_transitions(episode, decisions, SMALL)
+    # Decisions 0-2 run until the rejection at 600; the episode still succeeds
+    # after the operator restarts at 700, but the stopped run earns nothing.
+    assert [r["done"] for r in rows] == [0.0, 0.0, 1.0, 1.0]
+    assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
 
 
 def test_transitions_tile_observations_and_discount_elapsed_steps():

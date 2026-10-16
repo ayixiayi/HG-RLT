@@ -16,7 +16,8 @@ Replay (one shard per labelled episode, built only after its outcome is saved):
   reply later than its chunk) is skipped;
 * the last executed decision of a run is terminal: reward 1 if the episode succeeded
   and no human took over after this run (handing back to the VLA with ``p`` or
-  pausing with ``s`` keeps the credit), otherwise 0. The value is the
+  pausing with ``s`` keeps the credit), otherwise 0. A run the safety layer
+  stopped (policy target rejected) ends there with 0. The value is the
   probability of finishing without human help once the actor hands off.
 
 Takeover segments carry no RL token, so this version leaves them out of the
@@ -86,10 +87,14 @@ def chain_transitions(episode, decisions, config):
         )
     ]
     takeovers = event_ns[episode["event_state"] == "INTERVENTION"]
+    # The safety layer rejected an RL target: the run ends there, uncredited.
+    rejections = event_ns[
+        np.char.startswith(episode["event_reason"].astype(str), "Policy rejected")
+    ]
     discards = episode.get("discards", [])
     discard_starts = np.array([a for a, _ in discards], dtype=np.int64)
     # An operator-discarded interval (c ... x) ends any run crossing into it.
-    boundaries = np.sort(np.concatenate([boundaries, discard_starts]))
+    boundaries = np.sort(np.concatenate([boundaries, discard_starts, rejections]))
     row_ns = episode.get("row_ns")
     d = decisions
     count = len(d["accepted_ns"])
@@ -151,11 +156,12 @@ def chain_transitions(episode, decisions, config):
         else:
             helped = bool(np.any(takeovers >= start))
             discarded_next = run_end in set(discard_starts.tolist())
+            rejected = run_end in set(rejections.tolist())
             next_ref = np.zeros(config.action_dim, np.float32)
             next_token = np.zeros_like(d["token"][i])
             next_proprio = np.zeros(rlt.PROPRIO, np.float32)
             next_committed = np.zeros(config.committed_dim, np.float32)
-            credited = success and not helped and not discarded_next
+            credited = success and not helped and not discarded_next and not rejected
             reward, done = (1.0 if credited else 0.0), 1.0
         rows.append(
             {
@@ -224,7 +230,21 @@ def sync_replay(recordings, replay_dir, config, policy_id=None):
     return added
 
 
-def learn(recordings, run, config=None, *, min_transitions=64, poll_s=10.0, once=False):
+# Before this many RL decisions the critic has nothing to tell apart and the
+# actor would only follow its noise; until then the collector keeps the
+# initial actor (ã plus smooth exploration).
+MIN_TRANSITIONS = 256
+
+
+def learn(
+    recordings,
+    run,
+    config=None,
+    *,
+    min_transitions=MIN_TRANSITIONS,
+    poll_s=10.0,
+    once=False,
+):
     """``config`` overrides RUN/config.json training parameters only."""
     run = Path(run)
     with rlt.exclusive_learner(run):
@@ -312,7 +332,9 @@ def _learn(recordings, run, config, min_transitions, poll_s, once):
             )
         elif fresh:
             message(
-                "RLT learner", f"replay {size} 条，攒够 {min_transitions} 条后开始训练"
+                "RLT learner",
+                f"replay {size} 条，攒够 {min_transitions} 条后开始训练；"
+                "之前 actor = VLA 参考 + 平滑探索",
             )
         if once:
             return version
@@ -334,7 +356,12 @@ def main(argv=None):
         type=Path,
         help="RLTConfig JSON；只能修改训练超参数，结构参数以运行目录的 config.json 为准",
     )
-    parser.add_argument("--min-transitions", type=int, default=64)
+    parser.add_argument(
+        "--min-transitions",
+        type=int,
+        default=MIN_TRANSITIONS,
+        help="replay 攒够这么多条 RL 决策才开始训练、发布 actor",
+    )
     parser.add_argument("--once", action="store_true", help="只同步训练一次后退出")
     args = parser.parse_args(argv)
     override = (
