@@ -184,6 +184,34 @@ def test_real_openpi_trainer_trains_saves_and_reloads_rl_token(tmp_path):
     assert vla and moved
 
 
+def test_single_pass_sampling_matches_upstream_actions_and_token(model_and_batch):
+    from openpi.policies.policy import Policy
+
+    model, observation, _ = model_and_batch
+    rng = jax.random.key(7)
+    noise = jax.random.normal(jax.random.key(8), (2, 30, model.action_dim))
+    actions, token = model.sample_actions_with_token(rng, observation, noise=noise)
+    expected = model.sample_actions(rng, observation, noise=noise)
+    np.testing.assert_allclose(np.asarray(actions), np.asarray(expected), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(token), np.asarray(model.compute_rl_token(observation)), rtol=1e-5, atol=1e-5
+    )
+    # Without explicit noise both draw it from the same rng.
+    a, _ = model.sample_actions_with_token(rng, observation)
+    np.testing.assert_allclose(
+        np.asarray(a), np.asarray(model.sample_actions(rng, observation)), rtol=1e-5, atol=1e-5
+    )
+    # Through Policy.infer: the tapped policy returns the actions it would without the tap.
+    single = jax.tree.map(lambda x: np.asarray(x[0]), observation.to_dict())
+    plain = Policy(model, transforms=[], output_transforms=[])
+    inner = Policy(model, transforms=[], output_transforms=[])
+    plain._rng = inner._rng = jax.random.key(3)  # Policy(rng=...) truth-tests the key
+    tapped = rl_token.TokenTap(inner)
+    np.testing.assert_allclose(
+        tapped.infer(single)["actions"], plain.infer(single)["actions"], rtol=1e-5, atol=1e-5
+    )
+
+
 def test_token_tap_matches_direct_token_and_sealed_reply(model_and_batch):
     from types import SimpleNamespace
 

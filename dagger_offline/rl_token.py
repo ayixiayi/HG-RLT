@@ -13,6 +13,8 @@ the online actor receives proprioception separately (as in the paper).
 import dataclasses
 import re
 
+import einops
+
 import flax.traverse_util
 import jax
 import jax.numpy as jnp
@@ -172,6 +174,61 @@ class RLTPi0(pi0.Pi0):
         """(b, E) RL token for an observation (deterministic, no sampling)."""
         return self.rl_token.encode(*self.prefix_embeddings(observation))
 
+    def sample_actions_with_token(self, rng, observation, *, num_steps=10, noise=None):
+        """Upstream ``Pi0.sample_actions`` plus the RL token of the same call.
+
+        The prefix forward pass that fills the KV cache already produces the
+        embeddings the token encodes, so serving runs the prefix once instead
+        of again for the token. The denoising loop is the pinned upstream one
+        unchanged; tests check actions and token against the two separate calls.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(
+                rng, (batch_size, self.action_horizon, self.action_dim)
+            )
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = pi0.make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        token = self.rl_token.encode(
+            *self._image_embeddings(prefix_out, prefix_mask, observation)
+        )
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            )
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0, token
+
 
 @dataclasses.dataclass(frozen=True)
 class RLTPi0Config(pi0_config.Pi0Config):
@@ -236,23 +293,32 @@ def config_from_contract(model, contract):
 
 
 class TokenTap:
-    """Wrap an OpenPI Policy: every infer also computes the RL token from the
-    exact transformed inputs of that call (``last`` holds it, float32 (E,))."""
+    """Wrap an OpenPI Policy: every infer also returns the RL token of its own
+    inputs (``last``, float32 (E,)). The policy's sampler is replaced by
+    ``sample_actions_with_token``, so the prefix runs once per inference."""
 
     def __init__(self, policy):
         self._policy = policy
         model = policy._model  # noqa: SLF001 - pinned upstream Policy
-        if not hasattr(model, "compute_rl_token"):
+        if not hasattr(model, "sample_actions_with_token"):
             raise TypeError("Policy model has no RL token")
-        self._token = nnx_utils.module_jit(model.compute_rl_token)
+        combined = nnx_utils.module_jit(model.sample_actions_with_token)
+        self._token = None
+
+        def sample(rng, observation, **kwargs):
+            actions, token = combined(rng, observation, **kwargs)
+            self._token = token
+            return actions
+
+        policy._sample_actions = sample  # noqa: SLF001 - Policy.infer calls it
         self.last = None
 
     def infer(self, obs, **kwargs):
-        self.last = None
+        self.last = self._token = None
         outputs = self._policy.infer(obs, **kwargs)
-        inputs = self._policy._input_transform(jax.tree.map(lambda x: x, obs))  # noqa: SLF001
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-        token = np.asarray(self._token(_model.Observation.from_dict(inputs))[0])
+        if self._token is None:
+            raise RuntimeError("Policy inference did not produce an RL token")
+        token = np.asarray(self._token[0])
         if token.ndim != 1 or not np.isfinite(token).all():
             raise ValueError("Invalid RL token")
         self.last = token.astype(np.float32)
