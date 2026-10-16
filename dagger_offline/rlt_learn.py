@@ -128,11 +128,10 @@ def chain_transitions(episode, decisions, config):
     # the next executed decision's observation) and the run's last executed
     # decision is terminal with the episode result.
     executed = [i for i, span in enumerate(spans) if span and span["ran"]]
-    rows = []
+    # What each executed decision's transition covers: [observation, stop).
+    windows = []
     for n, i in enumerate(executed):
-        span = spans[i]
-        observed, start = int(observed_all[i]), int(accepted_all[i])
-        run_end = span["run_end"]
+        observed, run_end = int(observed_all[i]), spans[i]["run_end"]
         j = executed[n + 1] if n + 1 < len(executed) else None
         chained = (
             j is not None
@@ -141,7 +140,13 @@ def chain_transitions(episode, decisions, config):
         )
         stop = int(observed_all[j]) if chained else run_end
         window = valid & (sent > 0) & (sent >= observed) & (sent < stop)
-        ran = commands[window]
+        windows.append((j, chained, stop, commands[window]))
+    rows = []
+    for n, i in enumerate(executed):
+        span = spans[i]
+        observed, start = int(observed_all[i]), int(accepted_all[i])
+        run_end = span["run_end"]
+        j, chained, stop, ran = windows[n]
         if row_ns is not None and stop < never:
             elapsed = int(np.sum((row_ns >= observed) & (row_ns < stop)))
         else:
@@ -156,11 +161,11 @@ def chain_transitions(episode, decisions, config):
         next_prefix = np.zeros(config.committed_dim, np.float32)
         if chained:
             next_qpos = d["proprio"][j][: rlt.JOINTS]
-            # What the successor's committed steps really were: the commands
-            # the robot acknowledged from its observation on (same as the
-            # head of the successor's own replay action).
-            following = valid & (sent > 0) & (sent >= int(observed_all[j]))
-            next_ran = commands[following][: min(int(d["skip"][j]), config.lead)]
+            # What the successor's committed steps really were: the head of
+            # its own window, as the robot acknowledged them (its replay
+            # action starts with exactly these).
+            next_ran = windows[n + 1][3][: config.chunk]
+            next_ran = next_ran[: min(int(d["skip"][j]), len(next_ran), config.lead)]
             next_skip = len(next_ran)
             if next_skip:
                 head = (next_ran - next_qpos[None]) / config.action_scale

@@ -379,6 +379,47 @@ def test_rl_run_stopped_by_the_safety_layer_is_not_credited():
     assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
 
 
+
+def test_successor_prefix_is_the_head_of_its_own_window():
+    from dagger_offline import rlt_learn
+
+    cfg = rlt.RLTConfig(token_dim=8, chunk=4, lead=3)
+    rows_ns = np.arange(100)
+    valid = np.ones(100, bool)
+    valid[51] = False  # a HOLD tick inside the successor's committed steps
+    episode = {
+        "attrs": {"outcome": "success"},
+        "row_ns": rows_ns * 10,
+        "sent": rows_ns * 10 + 5,
+        "valid": valid,
+        "commands": np.repeat(rows_ns[:, None] / 1000.0, 14, axis=1),
+        # The operator takes ownership at 535: later commands are not RL's.
+        "event_ns": np.array([535, 950]),
+        "event_reason": np.array(["ownership selected", "finish"]),
+        "event_state": np.array(["HOLD", "HOLD"]),
+        "discards": [],
+    }
+    n = 3
+    decisions = {
+        "observed_ns": np.array([100, 300, 500]),
+        "accepted_ns": np.array([130, 330, 520]),
+        "token": np.zeros((n, 8), np.float32),
+        "proprio": np.zeros((n, rlt.PROPRIO), np.float32),
+        "committed": np.full((n, cfg.lead, 14), 0.05),
+        "skip": np.array([0, 3, 3]),
+        "reference": np.zeros((n, cfg.chunk, 14)),
+        "planned": np.zeros((n, cfg.chunk, 14)),
+    }
+    rows = rlt_learn.chain_transitions(episode, decisions, cfg)
+    assert [r["done"] for r in rows] == [0.0, 0.0, 1.0]
+    # Only rows 50 and 52 ran before the boundary: the TD prefix of decision 1
+    # is exactly what its successor's replay action starts with.
+    assert rows[1]["next_skip"] == rows[2]["skip"] == 2
+    np.testing.assert_allclose(rows[1]["next_prefix"][:28], rows[2]["action"][:28])
+    np.testing.assert_allclose(rows[1]["next_prefix"][:28], np.repeat([0.050, 0.052], 14) / 0.5)
+    np.testing.assert_array_equal(rows[1]["next_prefix"][28:], 0)
+
+
 def test_transitions_tile_observations_and_discount_elapsed_steps():
     from dagger_offline import rlt_learn
 
