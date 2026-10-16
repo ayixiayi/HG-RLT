@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HG-RLT 控制台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">HG-RLT</div>
+  <div id="mode-chip" class="mode-chip" hidden></div>
+  <nav class="tabs" role="tablist">
+    <button data-tab="session" class="active">采集</button>
+    <button data-tab="models">模型</button>
+    <button data-tab="hw">硬件</button>
+    <button data-tab="status">状态</button>
+    <button data-tab="results">结果</button>
+  </nav>
+  <div id="conn" class="conn">连接中…</div>
+  <button id="btn-shutdown" class="small" title="先结束采集和控制台启动的模型服务，再退出控制台进程">关闭控制台</button>
+</header>
+
+<main>
+  <!-- 采集 / 评估 -->
+  <section id="tab-session" class="tab active">
+    <form id="session-form" class="card">
+      <h2>开始采集或评估</h2>
+      <div class="row">
+        <label>类型
+          <select name="kind">
+            <option value="eval">评估（data/eval）</option>
+            <option value="recordings">采集（data/recordings）</option>
+          </select>
+        </label>
+        <label>模型<select name="deployment" id="session-model"></select></label>
+      </div>
+      <div class="row">
+        <label>目录名<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" maxlength="64" autocomplete="off"></label>
+        <label>条数（0 不限）<input name="episodes" type="number" min="0" max="500" value="20"></label>
+      </div>
+      <div class="row">
+        <label>入口
+          <select name="command">
+            <option value="collect">collect：主臂全程跟随</option>
+            <option value="collect-compat">collect-compat：按 h 后主臂才对齐</option>
+          </select>
+        </label>
+        <label>RLT 目录名（可选，data/rlt/…）<input name="rlt" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" maxlength="64" autocomplete="off" placeholder="不用 RLT 留空"></label>
+      </div>
+      <pre id="session-plan" class="plan"></pre>
+      <div class="actions"><button class="primary" type="submit">开始…</button></div>
+      <p class="error" id="session-error"></p>
+    </form>
+
+    <div id="session-view" class="card" hidden>
+      <div class="session-head">
+        <div>
+          <div class="session-title" id="session-label"></div>
+          <div class="muted" id="session-sub"></div>
+        </div>
+        <button id="btn-session-stop" class="danger">结束采集…</button>
+      </div>
+      <div id="mode-big" class="mode-big"></div>
+      <div id="takeover" class="takeover" hidden></div>
+      <div id="stage-text" class="stage-text"></div>
+      <div id="notice" class="notice" hidden></div>
+      <div id="session-stats" class="stats"></div>
+
+      <label class="check unlock"><input type="checkbox" id="unlock"> 我在机械臂旁：启用按键和键盘快捷键（s 保持始终可用）</label>
+      <div id="pad" class="pad"></div>
+      <details class="allkeys">
+        <summary>全部按键</summary>
+        <div id="keys-all" class="keys-all"></div>
+      </details>
+    </div>
+
+    <div class="card" id="session-term-card" hidden>
+      <h3>采集终端输出</h3>
+      <pre id="session-term" class="term"></pre>
+      <form class="input-row" data-line="session">
+        <input autocomplete="off" maxlength="200" placeholder="向采集进程发送一行（回车结尾）">
+        <button type="submit">发送</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- 模型 -->
+  <section id="tab-models" class="tab">
+    <div class="card">
+      <h2>模型服务 <button id="btn-models" class="small">刷新</button></h2>
+      <p class="hint">控制台一次只启动一个模型服务（GPU 0）。端口已被占用或显存不足时拒绝启动；别人启动的服务只显示，不能停止。</p>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>模型</th><th>端口</th><th>checkpoint</th><th>policy_id</th><th>状态</th><th></th></tr></thead>
+        <tbody id="models"></tbody>
+      </table></div>
+      <p class="error" id="models-error"></p>
+    </div>
+    <div class="card" id="model-term-card" hidden>
+      <h3 id="model-term-title">模型服务日志</h3>
+      <pre id="model-term" class="term"></pre>
+    </div>
+  </section>
+
+  <!-- 硬件进程 -->
+  <section id="tab-hw" class="tab">
+    <p class="banner">YAM 没有物理急停。重启或关闭硬件进程会先关电机，双臂失去保持力：先用手托住双臂，现场有人能随时断电。采集进行时不能操作硬件进程。</p>
+    <div class="card">
+      <h2>硬件进程</h2>
+      <div id="daemon-summary" class="kv"></div>
+      <div class="actions">
+        <button id="btn-daemon-check">检查（daemon-check）</button>
+        <button id="btn-daemon-restart" class="warn">重启硬件进程…</button>
+        <button id="btn-daemon-stop" class="danger">关闭硬件进程…</button>
+      </div>
+      <pre id="daemon-check-out" class="term short" hidden></pre>
+    </div>
+    <div class="card" id="daemon-term-card" hidden>
+      <h3 id="daemon-term-title">硬件进程命令</h3>
+      <p class="hint">命令自己的确认提示出现后，在下面输入 <code>HG-DAEMON-ON-SITE</code>（关闭时输入 <code>off</code>）并发送。</p>
+      <pre id="daemon-term" class="term"></pre>
+      <form class="input-row" data-line="daemon">
+        <input autocomplete="off" maxlength="200" placeholder="回答命令的确认提示">
+        <button type="submit">发送</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- 状态 -->
+  <section id="tab-status" class="tab">
+    <div class="card">
+      <h2>机器状态 <button id="btn-status" class="small">刷新</button> <span id="status-time" class="muted small-text"></span></h2>
+      <div class="grid2">
+        <div>
+          <h3>GPU</h3>
+          <div id="gpu"></div>
+        </div>
+        <div>
+          <h3>端口</h3>
+          <div class="table-wrap"><table class="table"><thead><tr><th>端口</th><th>用途</th><th>状态</th></tr></thead><tbody id="ports"></tbody></table></div>
+        </div>
+      </div>
+      <h3>采集进程</h3>
+      <div id="collect-procs"></div>
+      <h3>版本</h3>
+      <div id="version" class="kv"></div>
+    </div>
+  </section>
+
+  <!-- 结果 -->
+  <section id="tab-results" class="tab">
+    <div class="card">
+      <h2>评估对比 <button id="btn-results" class="small">刷新</button></h2>
+      <p class="hint">同一天（目录名 MMDD- 开头）的 data/eval 目录放在一张表里。自主成功：成功且没有人工接管。只统计 episodes/ 中标为成功或失败的条目。</p>
+      <div id="compare"></div>
+    </div>
+    <div class="card">
+      <h2>全部目录</h2>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>目录</th><th>模型</th><th>成功 / 已标</th><th>自主成功</th><th>接管</th><th>弃用 / 未完成</th><th>失败类型</th></tr></thead>
+        <tbody id="results"></tbody>
+      </table></div>
+    </div>
+    <div class="card" id="detail-card" hidden>
+      <h2 id="detail-title"></h2>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>文件</th><th>位置</th><th>结果</th><th>失败类型</th><th>接管</th><th>RL 段</th><th>时长 s</th><th>模型</th></tr></thead>
+        <tbody id="detail"></tbody>
+      </table></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="confirm">
+  <form method="dialog" id="confirm-form">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <p>输入 <code id="confirm-phrase"></code> 确认：</p>
+    <input id="confirm-input" autocomplete="off">
+    <div class="actions">
+      <button value="cancel" formnovalidate>取消</button>
+      <button id="confirm-ok" class="warn" value="ok" disabled>执行</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

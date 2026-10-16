@@ -100,6 +100,14 @@ case "$command" in
     exec "$MODEL" -m dagger_offline.deployment serve --rhos-root "$R" \
       --openpi "$OPENPI" "$@"
     ;;
+  ui)
+    # Web console (foreground). Children are the ./hgrlt commands above.
+    exec "$LIVE" -m dagger_offline.webui "$@"
+    ;;
+  console)
+    # The web console in the background: start | stop | status | url | log | attach.
+    exec bash "$H/Dagger-Practice/console.sh" "$@"
+    ;;
   *)
     heading='' reset=''
     if [[ -t 1 && ! ${NO_COLOR+x} && ${TERM:-} != dumb ]]; then
@@ -140,6 +148,12 @@ case "$command" in
     echo '    download-model --source oss://bucket/完整地址 --destination models/r1'
     echo '    下载后使用 models/r1/deployment.json 选择模型。'
     echo '    OSS 默认 bucket=ayixiayi-model-relay；用 --destination / --endpoint / --config 更换。'
+    echo
+    echo '  网页控制台'
+    echo '    console start [--port 8810]  后台启动，打印带令牌的网址；SSH 断开不影响采集'
+    echo '    console status | url | log | attach | stop'
+    echo '    ui [--host 127.0.0.1] [--port 8810]   前台运行同一控制台'
+    echo '    其他电脑：ssh -N -L 8810:127.0.0.1:8810 -p 2222 ziyu@<实验室地址>，再打开网址'
     echo
     echo '  服务管理（现场确认设备与端口空闲后使用）'
     echo '    daemon-restart            托住双臂：下电退出旧进程，再使能新进程（FAULT 恢复用这个）'

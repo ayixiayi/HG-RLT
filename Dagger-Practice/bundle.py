@@ -40,6 +40,7 @@ HG_FILES = (
     "Dagger-Practice/daemon.py",
     "Dagger-Practice/run_robot.py",
     "Dagger-Practice/collect.py",
+    "Dagger-Practice/console.sh",
     "Dagger-Practice/patches/README.md",
     "Dagger-Practice/patches/dynamixel-fresh-sample.patch",
     "Dagger-Practice/patches/dynamixel_fresh_sample.py",
@@ -62,6 +63,10 @@ HG_FILES = (
     "dagger_offline/live_control.py",
     "dagger_offline/live_robot.py",
     "dagger_offline/live_recording.py",
+    "dagger_offline/webui.py",
+    "dagger_offline/webui_static/index.html",
+    "dagger_offline/webui_static/app.js",
+    "dagger_offline/webui_static/style.css",
     "dagger_offline/test_collection.py",
     "dagger_offline/test_arbitration.py",
     "dagger_offline/test_round_data.py",
@@ -76,6 +81,7 @@ HG_FILES = (
     "dagger_offline/test_live_robot.py",
     "dagger_offline/test_live_recording.py",
     "dagger_offline/test_live_runner.py",
+    "dagger_offline/test_webui.py",
 )
 
 
