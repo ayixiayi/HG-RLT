@@ -153,9 +153,18 @@ def chain_transitions(episode, decisions, config):
         committed = rlt.committed_residual(d["committed"][i], qpos, config)
         skip = min(int(d["skip"][i]), len(executed_steps))
         next_skip = 0
+        next_prefix = np.zeros(config.committed_dim, np.float32)
         if chained:
-            next_skip = min(int(d["skip"][j]), config.lead)
             next_qpos = d["proprio"][j][: rlt.JOINTS]
+            # What the successor's committed steps really were: the commands
+            # the robot acknowledged from its observation on (same as the
+            # head of the successor's own replay action).
+            following = valid & (sent > 0) & (sent >= int(observed_all[j]))
+            next_ran = commands[following][: min(int(d["skip"][j]), config.lead)]
+            next_skip = len(next_ran)
+            if next_skip:
+                head = (next_ran - next_qpos[None]) / config.action_scale
+                next_prefix[: head.size] = head.reshape(-1)
             next_ref = rlt.to_residual(d["reference"][j], next_qpos, config)
             next_token, next_proprio = d["token"][j], d["proprio"][j]
             next_committed = rlt.committed_residual(d["committed"][j], next_qpos, config)
@@ -189,6 +198,7 @@ def chain_transitions(episode, decisions, config):
                 "intervention": 0.0,
                 "skip": skip,
                 "next_skip": next_skip,
+                "next_prefix": next_prefix,
             }
         )
     return rows
@@ -208,6 +218,9 @@ def episode_transitions(path, config, policy_id=None):
     d = episode["rl_decisions"]
     if len(d["accepted_ns"]) == 0:
         return []
+    if "committed" not in d or "skip" not in d:
+        # Before any other layout check: an old recording may differ in more.
+        raise SynchronousRecording(f"{path.name}: synchronous RLT recording")
     if d["reference"].shape[1:] != (config.chunk, rlt.JOINTS):
         raise ValueError(f"{path}: RL chunk differs from the learner config")
     return chain_transitions(episode, {**d, "planned": d["actor"]}, config)

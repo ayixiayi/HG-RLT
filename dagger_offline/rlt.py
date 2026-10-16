@@ -49,9 +49,15 @@ TRANSITION_FIELDS = (
     "intervention",
     "skip",  # leading steps of `action` that were already committed
     "next_skip",
+    # The successor's committed steps as the robot received them (after the
+    # safety filter), residual from the next qpos; `next_committed` is what
+    # the actor saw queued.
+    "next_prefix",
 )
 # Bumped when the transition layout changes: older shards are refused.
-REPLAY_FORMAT = 2
+REPLAY_FORMAT = 3
+# Bumped when the same weights would act differently: older actors are refused.
+ACTOR_FORMAT = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,7 +125,7 @@ class RLTConfig:
         ]
 
     def actor_digest(self):
-        return self._hash(self.ACTOR_FIELDS)
+        return self._hash(self.ACTOR_FIELDS, actor_format=ACTOR_FORMAT)
 
     def replay_digest(self):
         return self._hash(self.REPLAY_FIELDS, replay_format=REPLAY_FORMAT)
@@ -629,7 +635,7 @@ class Learner:
                 target_actor, next_state, batch["next_ref"], cfg, jnp
             ) + expand_knots(noise, cfg, jnp)
             next_action = with_prefix(
-                next_action, batch["next_committed"], batch["next_skip"], cfg, jnp
+                next_action, batch["next_prefix"], batch["next_skip"], cfg, jnp
             )
             target_q = jnp.minimum(
                 self._q(target_critics[0], next_state, next_action),

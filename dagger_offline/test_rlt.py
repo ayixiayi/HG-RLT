@@ -193,6 +193,33 @@ def test_old_synchronous_recordings_are_skipped_not_fatal(tmp_path, monkeypatch)
     ]
 
 
+
+def test_actor_published_under_older_semantics_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(rlt, "ACTOR_FORMAT", rlt.ACTOR_FORMAT - 1)
+    rlt.publish_actor(tmp_path, SMALL, rlt.init_actor(SMALL), 1, "m1")
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="different RLT config"):
+        rlt.load_actor(tmp_path, SMALL, "m1")
+
+
+def test_synchronous_recording_is_recognised_before_layout_checks(monkeypatch):
+    from pathlib import Path
+
+    from dagger_offline import rlt_learn
+
+    old = {  # 20-step synchronous decisions: no committed, no skip
+        "metadata": {"rlt": {"policy_id": "m1"}},
+        "rl_decisions": {
+            "accepted_ns": np.array([1]),
+            "reference": np.zeros((1, 20, 14)),
+            "actor": np.zeros((1, 20, 14)),
+        },
+    }
+    monkeypatch.setattr(rlt_learn, "read_episode", lambda path: old)
+    with pytest.raises(rlt_learn.SynchronousRecording):
+        rlt_learn.episode_transitions(Path("episode-000001.h5"), SMALL, "m1")
+
+
 def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
     watcher = rlt.ActorWatcher(tmp_path, SMALL)
     assert watcher.poll() is None
@@ -227,6 +254,7 @@ def _row(rng, cfg, **override):
         "intervention": 0.0,
         "skip": 0.0,
         "next_skip": 0.0,
+        "next_prefix": np.zeros(cfg.committed_dim),
     }
     row.update(override)
     return row
@@ -356,9 +384,17 @@ def test_transitions_tile_observations_and_discount_elapsed_steps():
 
     rows = rlt_learn.chain_transitions(*_episode(), SMALL)
     assert [r["done"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
-    # Committed steps of each decision and of its successor travel along.
+    # Committed steps of each decision and of its successor travel along;
+    # the successor's prefix is what the robot received (rows 30, 50, 70),
+    # not the queued 0.05 the actor saw.
     assert [r["skip"] for r in rows] == [0, 1, 1, 1]
     assert [r["next_skip"] for r in rows] == [1, 1, 1, 0]
+    for r, row in zip(rows[:3], (30, 50, 70), strict=True):
+        np.testing.assert_allclose(r["next_prefix"], row / 1000 / 0.5, atol=1e-7)
+        np.testing.assert_allclose(r["next_committed"], 0.05 / 0.5)
+    # It is exactly the head of the successor's own replay action.
+    for r, nxt in zip(rows[:3], rows[1:], strict=True):
+        np.testing.assert_allclose(r["next_prefix"], nxt["action"][:14])
     assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
     # Decision 0 observed at 100, next state observed at 300: 20 rows elapse.
     assert rows[0]["discount"] == pytest.approx(SMALL.gamma**20)
