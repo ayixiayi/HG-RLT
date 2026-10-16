@@ -2160,17 +2160,20 @@ def test_rlt_episode_replay_learner_and_hot_reload(tmp_path):
         assert np.all(
             np.abs(d["actor"][:] - d["reference"][:])[..., [0, 1, 2]] <= 0.15 + 1e-9
         )
-        # Synchronous chunks: nothing runs between a state and its decision.
+        # Back-to-back chunks: every decision after the first was requested
+        # while the previous chunk still ran; those steps are its committed
+        # steps, and the robot never paused between chunks.
         observed = d["observed_ns"][:].astype(np.int64)
         accepted = d["accepted_ns"][:].astype(np.int64)
-        sent = f["pairing/command_sent_ns"][:]
+        assert d["committed"].shape == (count, config.lead, 14)
+        skip = d["skip"][:]
+        assert skip[0] == 0 and np.all((skip[1:] >= 1) & (skip[1:] <= config.lead))
+        sent = f["pairing/command_sent_ns"][:].astype(np.int64)
         valid = f["pairing/action_valid"][:].astype(bool)
         for o, a in zip(observed[1:], accepted[1:], strict=True):
-            assert not np.any(valid & (sent >= o) & (sent < a))
-        # Every chunk but the last ran completely before the next observation.
-        for i in range(count - 1):
-            ran = valid & (sent >= accepted[i]) & (sent < accepted[i + 1])
-            assert ran.sum() == config.chunk
+            assert np.any(valid & (sent >= o) & (sent < a))
+        during = np.sort(sent[valid & (sent >= accepted[0]) & (sent <= accepted[-1])])
+        assert np.diff(during).max() < 1.5e9 / 30  # one command per control step
     rows = rlt_learn.episode_transitions(h.path, config)
     assert rows and len(rows) <= count
     assert [r["done"] for r in rows[:-1]] == [0.0] * (len(rows) - 1)
@@ -2244,7 +2247,7 @@ def test_r_without_rlt_is_ignored_and_rl_needs_token(tmp_path):
         h.run()
 
 
-def _rl_harness(path, keys, run, config, rl_lead=0):
+def _rl_harness(path, keys, run, config, rl_lead=None):
     from dagger_offline import rlt
     from dagger_offline.live_control import Controller
 
@@ -2354,14 +2357,3 @@ def test_learner_restart_resumes_and_refuses_to_overwrite_without_state(tmp_path
     (run / "learner.pkl").write_bytes(state)
     assert rlt_learn.learn(recordings, run, config, min_transitions=1, once=True) == 3
 
-
-def test_prefetched_rl_recording_is_refused_by_the_replay(tmp_path):
-    pytest.importorskip("jax")
-    from dagger_offline import rlt, rlt_learn
-
-    config = rlt.RLTConfig(token_dim=8, hidden=32, batch=32)
-    path = tmp_path / "rec/episodes/episode-000001.h5"
-    h = _rl_harness(path, {0: ["r"], 90: ["k"]}, tmp_path / "run", config, rl_lead=3)
-    h.run(review=lambda: "success", metadata={"collection": {"group": "g"}})
-    with pytest.raises(ValueError, match="rl_lead=0"):
-        rlt_learn.episode_transitions(path, config)

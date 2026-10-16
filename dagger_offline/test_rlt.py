@@ -5,22 +5,33 @@ import pytest
 
 from dagger_offline import rlt
 
-SMALL = rlt.RLTConfig(token_dim=8, chunk=2, hidden=64, batch=128)
+SMALL = rlt.RLTConfig(token_dim=8, chunk=2, lead=1, hidden=64, batch=128)
 
 
 def test_untrained_actor_follows_the_reference_and_round_trips_residuals():
     actor = rlt.Actor(SMALL, rlt.init_actor(SMALL), seed=1)
     qpos = np.linspace(-0.4, 0.4, 14)
     ref = qpos[None] + np.array([[0.02], [0.05]]) * np.ones((1, 14))
+    held = rlt.pad_committed([], qpos, SMALL)
     chunk, residual = actor.act(
-        np.zeros(8), rlt.proprio(qpos, qpos), ref, qpos, explore=False
+        np.zeros(8), rlt.proprio(qpos, qpos), held, ref, qpos, explore=False
     )
     assert chunk.shape == (2, 14) and residual.shape == (28,)
     np.testing.assert_allclose(chunk, ref, atol=5e-3)
     back = rlt.from_residual(rlt.to_residual(ref, qpos, SMALL), qpos, SMALL)
     np.testing.assert_allclose(back, ref, atol=1e-6)
     with pytest.raises(ValueError, match="size"):
-        actor.act(np.zeros(9), rlt.proprio(qpos, qpos), ref, qpos)
+        actor.act(np.zeros(9), rlt.proprio(qpos, qpos), held, ref, qpos)
+    # Committed steps: padded with the last one, or with qpos when none.
+    steps = qpos[None] + 0.1
+    np.testing.assert_allclose(rlt.pad_committed(steps, qpos, SMALL), steps)
+    two = rlt.RLTConfig(token_dim=8, chunk=4, lead=3)
+    padded = rlt.pad_committed(steps, qpos, two)
+    assert padded.shape == (3, 14) and np.allclose(padded, steps[0])
+    with pytest.raises(ValueError, match="lead"):
+        rlt.pad_committed(np.repeat(steps, 2, 0), qpos, SMALL)
+    with pytest.raises(ValueError, match="lead"):
+        rlt.RLTConfig(chunk=4, lead=4)
 
 
 def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
@@ -35,7 +46,7 @@ def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
     second = watcher.poll()
     assert second.version == 2 and np.allclose(second.params["b0"], params["b0"])
     assert [p.name for p in tmp_path.iterdir()] == ["actor.npz"]
-    other = rlt.RLTConfig(token_dim=8, chunk=3)
+    other = rlt.RLTConfig(token_dim=8, chunk=3, lead=1)
     with pytest.raises(ValueError, match="different RLT config"):
         rlt.load_actor(tmp_path, other)
 
@@ -44,6 +55,7 @@ def _row(rng, cfg, **override):
     row = {
         "token": rng.standard_normal(cfg.token_dim),
         "proprio": rng.standard_normal(rlt.PROPRIO),
+        "committed": np.zeros(cfg.committed_dim),
         "ref": np.zeros(cfg.action_dim),
         "action": rng.uniform(-0.5, 0.5, cfg.action_dim),
         "reward": 0.0,
@@ -51,6 +63,7 @@ def _row(rng, cfg, **override):
         "done": 1.0,
         "next_token": np.zeros(cfg.token_dim),
         "next_proprio": np.zeros(rlt.PROPRIO),
+        "next_committed": np.zeros(cfg.committed_dim),
         "next_ref": np.zeros(cfg.action_dim),
         "intervention": 0.0,
     }
@@ -68,7 +81,9 @@ def test_replay_shards_round_trip_and_refuse_other_configs(tmp_path):
     replay = rlt.load_replay(tmp_path, SMALL)
     assert replay["token"].shape == (6, 8) and replay["action"].shape == (6, 28)
     with pytest.raises(ValueError, match="another RLT config"):
-        rlt.load_replay(tmp_path, rlt.RLTConfig(token_dim=8, chunk=3))
+        rlt.load_replay(tmp_path, rlt.RLTConfig(token_dim=8, chunk=3, lead=1))
+    with pytest.raises(ValueError, match="another RLT config"):
+        rlt.load_replay(tmp_path, rlt.RLTConfig(token_dim=8, chunk=2, lead=0))
     with pytest.raises(ValueError, match="exactly"):
         rlt.ReplayWriter(tmp_path, SMALL, "x").add(token=np.zeros(8))
     with pytest.raises(FileExistsError):
@@ -106,7 +121,12 @@ def test_td3_learner_improves_on_the_reference(reward_scale):
 
     learned = regret(
         lambda t: actor.act(
-            t, np.zeros(rlt.PROPRIO), np.zeros((2, 14)), zero, explore=False
+            t,
+            np.zeros(rlt.PROPRIO),
+            rlt.pad_committed([], zero, SMALL),
+            np.zeros((2, 14)),
+            zero,
+            explore=False,
         )[1]
     )
     reference = regret(lambda t: np.zeros(SMALL.action_dim))
@@ -114,23 +134,22 @@ def test_td3_learner_improves_on_the_reference(reward_scale):
 
 
 def _episode(idle_last=False, **extra):
-    """Synchronous RL timeline: every chunk runs its SMALL.chunk commands from
-    its acceptance and finishes before the next state is observed."""
+    """Back-to-back RL timeline at 10 ns per control step: commands every step
+    (the next decision observes while the current chunk still runs); command
+    r holds the value r/1000 on every joint."""
     rows = np.arange(100)
     observed = np.array([100, 300, 500, 700] + ([900] if idle_last else []))
     # Uneven reply latency: decision 1 is accepted 90 ns after its image.
     accepted = observed + np.array([30, 90, 30, 30] + ([30] if idle_last else []))
-    sent = rows * 10 + 5
-    executing = accepted[:4]  # an idle last decision is ended (k) before acting
-    valid = np.zeros(100, bool)
-    for a in executing:
-        valid |= (sent >= a) & (sent < a + 10 * SMALL.chunk)
+    valid = np.ones(100, bool)
+    if idle_last:
+        valid[93:] = False  # k right after the last decision was accepted
     episode = {
         "attrs": {"outcome": "success"},
         "row_ns": rows * 10,
-        "sent": sent,
+        "sent": rows * 10 + 5,
         "valid": valid,
-        "commands": np.tile(np.linspace(-0.1, 0.1, 14), (100, 1)),
+        "commands": np.repeat(rows[:, None] / 1000.0, 14, axis=1),
         "event_ns": np.array([950]),
         "event_reason": np.array(["finish"]),
         "event_state": np.array(["HOLD"]),
@@ -143,13 +162,14 @@ def _episode(idle_last=False, **extra):
         "accepted_ns": accepted,
         "token": np.zeros((n, SMALL.token_dim), np.float32),
         "proprio": np.zeros((n, rlt.PROPRIO), np.float32),
+        "committed": np.full((n, SMALL.lead, 14), 0.05),
         "reference": np.zeros((n, SMALL.chunk, 14)),
         "planned": np.zeros((n, SMALL.chunk, 14)),
     }
     return episode, decisions
 
 
-def test_transition_covers_its_chunk_and_discounts_elapsed_steps():
+def test_transitions_tile_observations_and_discount_elapsed_steps():
     from dagger_offline import rlt_learn
 
     rows = rlt_learn.chain_transitions(*_episode(), SMALL)
@@ -157,16 +177,21 @@ def test_transition_covers_its_chunk_and_discounts_elapsed_steps():
     assert [r["reward"] for r in rows] == [0.0, 0.0, 0.0, 1.0]
     # Decision 0 observed at 100, next state observed at 300: 20 rows elapse.
     assert rows[0]["discount"] == pytest.approx(SMALL.gamma**20)
+    # Decision 1 (observed 300, accepted 390): its action starts with what ran
+    # from its observation on, i.e. the committed steps at rows 30, 31.
+    np.testing.assert_allclose(rows[1]["action"], np.repeat([0.030, 0.031], 14) / 0.5)
+    # Committed steps are part of the state and of the next state.
+    np.testing.assert_allclose(rows[0]["committed"], 0.05 / 0.5)
+    np.testing.assert_allclose(rows[0]["next_committed"], 0.05 / 0.5)
+    np.testing.assert_allclose(rows[-1]["next_committed"], 0.0)
 
 
-def test_prefetched_rl_chunks_are_refused():
+def test_synchronous_recordings_without_committed_steps_are_refused():
     from dagger_offline import rlt_learn
 
     episode, decisions = _episode()
-    # Decision 0 still acting after decision 1 observed (300) but before it
-    # was accepted (390): next state and executed actions disagree.
-    episode["valid"][30] = True
-    with pytest.raises(ValueError, match="rl_lead=0"):
+    del decisions["committed"]
+    with pytest.raises(ValueError, match="committed"):
         rlt_learn.chain_transitions(episode, decisions, SMALL)
 
 

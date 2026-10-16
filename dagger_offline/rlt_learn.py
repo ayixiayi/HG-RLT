@@ -2,16 +2,18 @@
 
 Replay (one shard per labelled episode, built only after its outcome is saved):
 
-* RL chunks are synchronous: the next decision observes only after this
-  chunk finished (recordings with prefetched RL chunks are refused);
-* one transition per RL actor decision that executed; ``action`` is what the
-  robot actually received (daemon ACK targets) until the next decision was
-  accepted, with the actor's remaining unexecuted steps filling the rest of
-  the chunk; ``discount`` = gamma**k for the k control steps between the two
-  observations;
+* RL chunks run back to back: the next decision observes ``lead`` steps
+  before the current chunk ends, and the steps still fixed at that moment are
+  part of its state (``committed``); recordings without them are refused;
+* one transition per RL actor decision that executed. Transitions tile time:
+  each runs from its observation to the next decision's observation;
+  ``action`` is the chunk aligned to the observation with the steps the robot
+  actually received there (daemon ACK targets: first the committed ones, then
+  the actor's), the actor's unexecuted steps filling the rest; ``discount`` =
+  gamma**k for the k control steps between the two observations;
 * executed decisions of one uninterrupted RL run chain into each other
-  (done=0); a decision that executed nothing (e.g. ``k`` right after it) is
-  skipped;
+  (done=0); a decision whose chunk never ran (e.g. ``k`` right after it, or a
+  reply later than its chunk) is skipped;
 * the last executed decision of a run is terminal: reward 1 if the episode succeeded
   and no human took over after this run (handing back to the VLA with ``p`` or
   pausing with ``s`` keeps the credit), otherwise 0. The value is the
@@ -92,45 +94,45 @@ def chain_transitions(episode, decisions, config):
     d = decisions
     count = len(d["accepted_ns"])
     never = 2**63
-    # Pass 1: the commands each decision actually executed. A decision's chunk
-    # runs from its acceptance until the next decision is accepted (or the run
-    # ends); RL decisions are synchronous (no prefetch), so the next state is
-    # observed only after this chunk finished.
+    if "committed" not in d:
+        raise ValueError(
+            "RL decisions without committed steps (synchronous RLT recording); "
+            "use a new --rlt run"
+        )
+    observed_all = d["observed_ns"].astype(np.int64)
+    accepted_all = d["accepted_ns"].astype(np.int64)
+    # Pass 1: did each decision's own chunk run? It runs from its acceptance
+    # until the next decision replaces it (or the run ends).
     spans = []
     for i in range(count):
-        observed, start = int(d["observed_ns"][i]), int(d["accepted_ns"][i])
+        observed, start = int(observed_all[i]), int(accepted_all[i])
         cut = boundaries[boundaries > observed]
         run_end = int(cut[0]) if len(cut) else never
-        following = int(d["accepted_ns"][i + 1]) if i + 1 < count else never
-        end = min(following, run_end)
-        if any(a < end and b > observed for a, b in discards):
+        following = int(accepted_all[i + 1]) if i + 1 < count else never
+        own_end = min(following, run_end)
+        if any(a < own_end and b > observed for a, b in discards):
             spans.append(None)  # touches an operator-discarded interval
             continue
-        window = (sent >= start) & valid & (sent > 0) & (sent < end)
-        if i + 1 < count and int(d["observed_ns"][i + 1]) < run_end:
-            late = window & (sent >= int(d["observed_ns"][i + 1]))
-            if np.any(late):
-                raise ValueError(
-                    "RL decision executed after the next state was observed "
-                    "(prefetched RL chunks); this replay needs rl_lead=0"
-                )
-        spans.append({"run_end": run_end, "end": end, "window": window})
-    # Pass 2: chain decisions that executed; a run's last executed decision is
-    # terminal and carries the episode result.
-    executed = [i for i, span in enumerate(spans) if span and span["window"].any()]
+        ran = valid & (sent > 0) & (sent >= start) & (sent < own_end)
+        spans.append({"run_end": run_end, "ran": bool(ran.any())})
+    # Pass 2: chain executed decisions; a transition covers [its observation,
+    # the next executed decision's observation) and the run's last executed
+    # decision is terminal with the episode result.
+    executed = [i for i, span in enumerate(spans) if span and span["ran"]]
     rows = []
     for n, i in enumerate(executed):
         span = spans[i]
-        observed, start = int(d["observed_ns"][i]), int(d["accepted_ns"][i])
+        observed, start = int(observed_all[i]), int(accepted_all[i])
         run_end = span["run_end"]
         j = executed[n + 1] if n + 1 < len(executed) else None
         chained = (
             j is not None
-            and int(d["observed_ns"][j]) < run_end
+            and int(observed_all[j]) < run_end
             and all(spans[m] is not None for m in range(i + 1, j))
         )
-        ran = commands[span["window"]]
-        stop = int(d["observed_ns"][j]) if chained else min(span["end"], run_end)
+        stop = int(observed_all[j]) if chained else run_end
+        window = valid & (sent > 0) & (sent >= observed) & (sent < stop)
+        ran = commands[window]
         if row_ns is not None and stop < never:
             elapsed = int(np.sum((row_ns >= observed) & (row_ns < stop)))
         else:
@@ -139,11 +141,12 @@ def chain_transitions(episode, decisions, config):
         qpos = d["proprio"][i][: rlt.JOINTS]
         planned = np.array(d["planned"][i], dtype=np.float64)
         planned[: len(executed_steps)] = executed_steps
+        committed = rlt.committed_residual(d["committed"][i], qpos, config)
         if chained:
-            next_ref = rlt.to_residual(
-                d["reference"][j], d["proprio"][j][: rlt.JOINTS], config
-            )
+            next_qpos = d["proprio"][j][: rlt.JOINTS]
+            next_ref = rlt.to_residual(d["reference"][j], next_qpos, config)
             next_token, next_proprio = d["token"][j], d["proprio"][j]
+            next_committed = rlt.committed_residual(d["committed"][j], next_qpos, config)
             reward, done = 0.0, 0.0
         else:
             helped = bool(np.any(takeovers >= start))
@@ -151,12 +154,14 @@ def chain_transitions(episode, decisions, config):
             next_ref = np.zeros(config.action_dim, np.float32)
             next_token = np.zeros_like(d["token"][i])
             next_proprio = np.zeros(rlt.PROPRIO, np.float32)
+            next_committed = np.zeros(config.committed_dim, np.float32)
             credited = success and not helped and not discarded_next
             reward, done = (1.0 if credited else 0.0), 1.0
         rows.append(
             {
                 "token": d["token"][i],
                 "proprio": d["proprio"][i],
+                "committed": committed,
                 "ref": rlt.to_residual(d["reference"][i], qpos, config),
                 "action": rlt.to_residual(planned, qpos, config),
                 "reward": reward,
@@ -166,6 +171,7 @@ def chain_transitions(episode, decisions, config):
                 "done": done,
                 "next_token": next_token,
                 "next_proprio": next_proprio,
+                "next_committed": next_committed,
                 "next_ref": next_ref,
                 "intervention": 0.0,
             }

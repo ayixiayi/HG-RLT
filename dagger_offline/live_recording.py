@@ -349,13 +349,26 @@ class EpisodeRecorder:
         reference,
         actor,
         actor_version,
+        committed,
+        skip,
     ):
-        """One RLT actor decision: its state, the VLA reference ã and its chunk."""
+        """One RLT actor decision: its state (token, proprio, committed steps
+        fixed at its observation), the VLA reference ã and its chunk, both
+        aligned to the observation, and how many steps ran before it took over."""
         observed_ns, accepted_ns = _timestamp(observed_ns), _timestamp(accepted_ns)
         token = np.asarray(token, dtype=np.float32)
         proprio = np.asarray(proprio, dtype=np.float32)
         reference = np.asarray(reference, dtype=np.float64)
         actor = np.asarray(actor, dtype=np.float64)
+        committed = np.asarray(committed, dtype=np.float64)
+        if (
+            committed.ndim != 2
+            or committed.shape[1] != 14
+            or not np.isfinite(committed).all()
+            or type(skip) is not int
+            or skip < 0
+        ):
+            raise ValueError("Invalid RL decision committed steps")
         if (
             token.ndim != 1
             or proprio.shape != (28,)
@@ -376,6 +389,8 @@ class EpisodeRecorder:
             ("proprio", proprio, "float32"),
             ("reference", reference, "float64"),
             ("actor", actor, "float64"),
+            ("committed", committed, "float64"),
+            ("skip", skip, "int64"),
         ):
             self._append(group, name, value, dtype)
 

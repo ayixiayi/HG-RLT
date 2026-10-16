@@ -88,7 +88,7 @@ class Controller:
         replan_lead=8,
         blend=0,
         rl=None,
-        rl_lead=0,
+        rl_lead=None,
     ):
         if not isinstance(horizon, int) or not 1 <= horizon <= 30:
             raise ValueError("execution horizon must be 1..30")
@@ -108,11 +108,14 @@ class Controller:
         self._accepted = []
         # RLT: `rl` decides an actor chunk from (token, proprio, reference).
         self.rl, self.rl_active = rl, False
-        # 0: RL chunks are synchronous (observe after the chunk finished), the
-        # timing the replay assumes; >0 prefetches like the VLA.
-        if rl is not None and not 0 <= rl_lead < rl.chunk:
-            raise ValueError("rl_lead must be 0 .. RL chunk-1")
-        self.rl_lead = rl_lead
+        # RL chunks prefetch their next decision rl_lead steps before the end
+        # (default: the run's config lead); the steps still running then are
+        # recorded as the decision's committed actions.
+        if rl is not None:
+            rl_lead = rl.config.lead if rl_lead is None else rl_lead
+            if rl_lead != rl.config.lead:
+                raise ValueError("rl_lead must equal the RLT run's lead")
+        self.rl_lead = rl_lead or 0
         self._decisions = []
         self._qpos = self._previous_qpos = None
         self._request_state = {}
@@ -211,7 +214,7 @@ class Controller:
                             }
                         )
                     if accepted and self.rl_active:
-                        self._rl_decide(ticket, token, now)
+                        self._rl_decide(ticket, token, now, values)
                     self._request_state.pop(ticket, None)
                     if accepted and not ticket.continuous:
                         self.ready_after = now
@@ -237,7 +240,7 @@ class Controller:
                     self.human_stamp = sampled_at
             if (
                 self.owner is Ownership.POLICY
-                and self.replan_lead
+                and (self.rl_lead if self.rl_active else self.replan_lead)
                 and 0
                 < self.arbiter.remaining
                 <= (self.rl_lead if self.rl_active else self.replan_lead)
@@ -287,26 +290,39 @@ class Controller:
 
     def _remember_state(self, ticket):
         # The actor's state is the proprioception at the observation the VLA
-        # (and its RL token) saw, not at reply time.
+        # (and its RL token) saw, not at reply time, plus the steps of the
+        # running chunk already fixed then (this tick's included).
         if self._qpos is not None:
+            committed = []
+            if self.rl_active and self.owner is Ownership.POLICY:
+                count = min(self.arbiter.remaining, self.rl_lead)
+                committed = self.arbiter.peek(count) if count else []
             self._request_state[ticket] = (
                 self._qpos.copy(),
                 self._previous_qpos.copy(),
+                np.asarray(committed, dtype=float).reshape(-1, 14),
             )
 
-    def _rl_decide(self, ticket, token, now):
+    def _rl_decide(self, ticket, token, now, values):
         if token is None:
             raise RuntimeError("RL mode needs a model that serves rl_token (RLT round)")
         if ticket not in self._request_state:
             raise RuntimeError("RL decision lacks the observation's joint state")
-        qpos, previous = self._request_state[ticket]
+        qpos, previous, committed = self._request_state[ticket]
         chunk = self.rl.chunk
-        reference = np.asarray(self.arbiter.peek(chunk), dtype=float)
-        actions, record = self.rl.decide(token, qpos, previous, reference)
-        self.arbiter.replace_chunk(actions)
+        # Both the VLA reference and the actor chunk are aligned to the
+        # observation; the first `skip` steps already ran (committed steps).
+        reference = np.asarray(values[:chunk], dtype=float)
+        skip = int(self.arbiter.last_skip)
+        actions, record = self.rl.decide(token, qpos, previous, reference, committed)
+        if skip < chunk:
+            self.arbiter.replace_chunk(actions[skip:])
+        else:
+            self.arbiter.hold(now=now)  # the reply outlived its chunk: decide anew
         self._decisions.append(
             {
                 **record,
+                "skip": skip,
                 "observed_at": ticket.observed_at,
                 "accepted_at": now,
                 "generation": self.arbiter.generation,

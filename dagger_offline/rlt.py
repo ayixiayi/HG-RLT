@@ -1,9 +1,18 @@
 """RLT online stage (arXiv 2604.23073): small actor-critic on the RL token.
 
-State ``x = (z_rl, proprio)``; the actor also sees the VLA reference chunk
-``ã`` (dropped to zero for half the training samples) and outputs a chunk of
-``C`` absolute joint targets. Everything is expressed as residuals from the
-current joint position, normalized by ``action_scale``.
+State ``x = (z_rl, proprio, committed)``; the actor also sees the VLA
+reference chunk ``ã`` (dropped to zero for half the training samples) and
+outputs a chunk of ``C`` absolute joint targets aligned to its observation.
+Everything is expressed as residuals from the current joint position,
+normalized by ``action_scale``.
+
+RL chunks run back to back like the VLA's: the next decision is requested
+``lead`` steps before the current chunk ends, so its observation is taken
+while those steps still run. They are fixed by then and form ``committed``
+(padded with the last of them: the robot then holds it), which keeps the
+state Markov under asynchronous execution (as in ARLI, arXiv 2608.23831).
+The actor's first entries, covering the time its inference took, are
+superseded by the committed steps that actually run.
 
 The actor forward pass is NumPy (the collection environment has no JAX). The
 learner (TD3: twin Q, target smoothing, BC anchor ``beta * |a - ã|^2``) needs
@@ -27,6 +36,7 @@ PROPRIO = 2 * JOINTS  # joint position + finite-difference velocity
 TRANSITION_FIELDS = (
     "token",
     "proprio",
+    "committed",
     "ref",
     "action",
     "reward",
@@ -34,6 +44,7 @@ TRANSITION_FIELDS = (
     "done",
     "next_token",
     "next_proprio",
+    "next_committed",
     "next_ref",
     "intervention",
 )
@@ -43,6 +54,7 @@ TRANSITION_FIELDS = (
 class RLTConfig:
     token_dim: int = 2048
     chunk: int = 10  # C: 0.33 s at 30 Hz
+    lead: int = 4  # request the next decision this many steps before a chunk ends
     hidden: int = 256
     layers: int = 2
     gamma: float = 0.99  # per control step; a transition discounts gamma**C
@@ -65,13 +77,21 @@ class RLTConfig:
         return self.chunk * JOINTS
 
     @property
+    def committed_dim(self):
+        return self.lead * JOINTS
+
+    @property
     def state_dim(self):
-        return self.token_dim + PROPRIO
+        return self.token_dim + PROPRIO + self.committed_dim
+
+    def __post_init__(self):
+        if not 0 <= self.lead < self.chunk:
+            raise ValueError("lead must be 0 .. chunk-1")
 
     # Fields that change what a published actor means / what replay contains.
     # Training hyperparameters (lr, beta, utd, ...) may change between runs.
-    ACTOR_FIELDS = ("token_dim", "chunk", "hidden", "layers", "action_scale")
-    REPLAY_FIELDS = ("token_dim", "chunk", "action_scale", "gamma")
+    ACTOR_FIELDS = ("token_dim", "chunk", "lead", "hidden", "layers", "action_scale")
+    REPLAY_FIELDS = ("token_dim", "chunk", "lead", "action_scale", "gamma")
 
     def _hash(self, fields):
         values = {k: getattr(self, k) for k in fields}
@@ -104,6 +124,26 @@ def to_residual(chunk, qpos, config):
     if chunk.shape != (config.chunk, JOINTS):
         raise ValueError(f"Expected a ({config.chunk}, {JOINTS}) chunk")
     residual = (chunk - np.asarray(qpos, dtype=np.float32)[None]) / config.action_scale
+    return residual.reshape(-1)
+
+
+def pad_committed(committed, qpos, config):
+    """Steps already fixed when an observation is taken -> (lead, 14): padded
+    with the last of them (held afterwards), or with qpos when there are none."""
+    committed = np.asarray(committed, dtype=np.float64).reshape(-1, JOINTS)
+    if len(committed) > config.lead:
+        raise ValueError("More committed steps than the RL lead")
+    fill = committed[-1] if len(committed) else np.asarray(qpos, dtype=np.float64)
+    pad = np.repeat(fill[None], config.lead - len(committed), axis=0)
+    return np.concatenate([committed, pad]).reshape(config.lead, JOINTS)
+
+
+def committed_residual(committed, qpos, config):
+    """(lead, 14) padded committed targets -> flat normalized residual."""
+    committed = np.asarray(committed, dtype=np.float32)
+    if committed.shape != (config.lead, JOINTS):
+        raise ValueError(f"Expected ({config.lead}, {JOINTS}) committed steps")
+    residual = (committed - np.asarray(qpos, dtype=np.float32)[None]) / config.action_scale
     return residual.reshape(-1)
 
 
@@ -164,10 +204,15 @@ class Actor:
         self.config, self.params, self.version = config, params, version
         self._rng = np.random.default_rng(seed)
 
-    def act(self, token, proprio_vec, ref_chunk, qpos, *, explore=True):
+    def act(self, token, proprio_vec, committed, ref_chunk, qpos, *, explore=True):
+        """``committed``: (lead, 14) padded absolute targets already fixed."""
         cfg = self.config
         state = np.concatenate(
-            [np.asarray(token, np.float32), np.asarray(proprio_vec, np.float32)]
+            [
+                np.asarray(token, np.float32),
+                np.asarray(proprio_vec, np.float32),
+                committed_residual(committed, qpos, cfg),
+            ]
         )
         if state.shape != (cfg.state_dim,):
             raise ValueError("RL token / proprio size does not match the actor")
@@ -198,11 +243,14 @@ class RLAgent:
         )
         self._initial = Actor(config, init_actor(config), version=0, seed=seed)
 
-    def decide(self, token, qpos, previous_qpos, reference):
+    def decide(self, token, qpos, previous_qpos, reference, committed=()):
+        """``reference``: VLA chunk aligned to the observation; ``committed``:
+        the steps already fixed at that observation (at most ``lead``)."""
         actor = self.watcher.poll() or self._initial
         state = proprio(qpos, previous_qpos)
         reference = np.asarray(reference, dtype=np.float64)
-        actions, _ = actor.act(token, state, reference, qpos)
+        committed = pad_committed(committed, qpos, self.config)
+        actions, _ = actor.act(token, state, committed, reference, qpos)
         bound = np.full(JOINTS, self.max_deviation)
         bound[[6, 13]] = 2 * self.max_deviation  # normalized grippers
         actions = reference + np.clip(actions - reference, -bound, bound)
@@ -210,6 +258,7 @@ class RLAgent:
         record = {
             "token": np.asarray(token, np.float32),
             "proprio": state,
+            "committed": committed,
             "reference": reference,
             "actor": actions,
             "actor_version": int(actor.version),
@@ -482,7 +531,7 @@ class Learner:
 
         def loss(critics, target_actor, target_critics, batch, key):
             next_state = jnp.concatenate(
-                [batch["next_token"], batch["next_proprio"]], -1
+                [batch["next_token"], batch["next_proprio"], batch["next_committed"]], -1
             )
             noise = jnp.clip(
                 cfg.target_noise * jax.random.normal(key, batch["action"].shape),
@@ -500,7 +549,9 @@ class Learner:
             )
             y = batch["reward"] + batch["discount"] * (1 - batch["done"]) * target_q
             y = jax.lax.stop_gradient(y)
-            state = jnp.concatenate([batch["token"], batch["proprio"]], -1)
+            state = jnp.concatenate(
+                [batch["token"], batch["proprio"], batch["committed"]], -1
+            )
             return sum(
                 jnp.mean(jnp.square(self._q(c, state, batch["action"]) - y))
                 for c in critics
@@ -519,7 +570,9 @@ class Learner:
         cfg, jnp, jax = self.config, self.jnp, self.jax
 
         def loss(actor, critic, batch, key):
-            state = jnp.concatenate([batch["token"], batch["proprio"]], -1)
+            state = jnp.concatenate(
+                [batch["token"], batch["proprio"], batch["committed"]], -1
+            )
             keep = jax.random.bernoulli(key, 1 - cfg.ref_dropout, (state.shape[0], 1))
             ref_in = batch["ref"] * keep
             action = actor_mean(actor, state, ref_in, jnp)

@@ -226,7 +226,7 @@ def preflight(args):
                 "policy_id": sealed["policy_id"],
                 "config": asdict(rl_config),
                 "config_digest": rl_config.digest(),
-                "rl_lead": 0,
+                "rl_lead": rl_config.lead,
                 "max_deviation": 0.15,
             }
         )
@@ -636,6 +636,8 @@ def run_loop(
                     reference=decision["reference"],
                     actor=decision["actor"],
                     actor_version=decision["actor_version"],
+                    committed=decision["committed"],
+                    skip=decision["skip"],
                 )
             for chunk in control.take_accepted():
                 recorder.policy_chunk(
@@ -992,7 +994,7 @@ def execute(args, config, profile, camera_config, reference, metadata):
             replan_lead=metadata["policy_execution"]["replan_lead"],
             blend=metadata["policy_execution"].get("blend", 0),
             rl=agent,
-            rl_lead=metadata.get("rlt", {}).get("rl_lead", 0),
+            rl_lead=metadata.get("rlt", {}).get("rl_lead"),
         )
         lease = TickLease(safety, uuid.uuid4().hex)
         sender = GuardedSender(robot, limits, initial, session_id=lease.session_id)
