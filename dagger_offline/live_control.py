@@ -314,7 +314,9 @@ class Controller:
         # observation; the first `skip` steps already ran (committed steps).
         reference = np.asarray(values[:chunk], dtype=float)
         skip = int(self.arbiter.last_skip)
-        actions, record = self.rl.decide(token, qpos, previous, reference, committed)
+        actions, record = self.rl.decide(
+            token, qpos, previous, reference, committed, skip=skip
+        )
         if skip < chunk:
             self.arbiter.replace_chunk(actions[skip:])
         else:

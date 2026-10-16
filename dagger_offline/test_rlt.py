@@ -9,13 +9,11 @@ SMALL = rlt.RLTConfig(token_dim=8, chunk=2, lead=1, hidden=64, batch=128)
 
 
 def test_untrained_actor_follows_the_reference_and_round_trips_residuals():
-    actor = rlt.Actor(SMALL, rlt.init_actor(SMALL), seed=1)
+    actor = rlt.Actor(SMALL, rlt.init_actor(SMALL))
     qpos = np.linspace(-0.4, 0.4, 14)
     ref = qpos[None] + np.array([[0.02], [0.05]]) * np.ones((1, 14))
     held = rlt.pad_committed([], qpos, SMALL)
-    chunk, residual = actor.act(
-        np.zeros(8), rlt.proprio(qpos, qpos), held, ref, qpos, explore=False
-    )
+    chunk, residual = actor.act(np.zeros(8), rlt.proprio(qpos, qpos), held, ref, qpos)
     assert chunk.shape == (2, 14) and residual.shape == (28,)
     np.testing.assert_allclose(chunk, ref, atol=5e-3)
     back = rlt.from_residual(rlt.to_residual(ref, qpos, SMALL), qpos, SMALL)
@@ -32,6 +30,54 @@ def test_untrained_actor_follows_the_reference_and_round_trips_residuals():
         rlt.pad_committed(np.repeat(steps, 2, 0), qpos, SMALL)
     with pytest.raises(ValueError, match="lead"):
         rlt.RLTConfig(chunk=4, lead=4)
+
+
+
+def test_exploration_continues_the_executed_command_smoothly(tmp_path):
+    # Exploration ramps from the last executed command toward a fresh target:
+    # no per-step noise and no jump when an RL chunk takes over.
+    cfg = rlt.RLTConfig(token_dim=8)
+    agent = rlt.RLAgent(cfg, tmp_path / "none", seed=0)
+    qpos = np.linspace(-0.4, 0.4, 14)
+    qpos[[6, 13]] = 0.5
+    t = np.arange(cfg.chunk)[:, None]
+    reference = qpos[None] + 0.004 * t
+    committed = reference[: cfg.lead] + 0.05
+    for skip in (1, 3, cfg.lead, cfg.lead + 2):
+        actions, record = agent.decide(
+            np.zeros(8), qpos, qpos, reference, committed, skip=skip
+        )
+        held = committed[min(skip, cfg.lead) - 1]
+        np.testing.assert_allclose(actions[skip - 1], held, atol=1e-6)
+        offset = (actions - reference)[skip - 1 :]
+        np.testing.assert_allclose(np.diff(offset, 2, axis=0), 0, atol=2e-3)
+        assert np.abs(np.diff(offset, axis=0)).max() < 0.05
+        np.testing.assert_array_equal(record["actor"], actions)
+    # From HOLD (nothing committed) the chunk starts at the reference.
+    actions, _ = agent.decide(np.zeros(8), qpos, qpos, reference, (), skip=0)
+    offset = actions - reference
+    assert np.abs(offset[0]).max() < 0.6 * cfg.actor_std * cfg.action_scale
+    np.testing.assert_allclose(np.diff(offset, 2, axis=0), 0, atol=2e-3)
+    # Successive targets differ: exploration is not a fixed bias.
+    targets = [
+        agent.decide(np.zeros(8), qpos, qpos, reference, (), skip=0)[0][-1]
+        - reference[-1]
+        for _ in range(50)
+    ]
+    std = np.std(targets, axis=0)[:6].mean()
+    expected = cfg.actor_std * cfg.action_scale * cfg.chunk / (cfg.chunk + 1)
+    assert 0.6 * expected < std < 1.4 * expected
+
+
+
+def test_recordings_binding_is_shared_by_collector_and_learner(tmp_path):
+    run = tmp_path / "rlt" / "new"
+    assert rlt.bound_recordings(run) is None
+    rlt.bind_recordings(run, tmp_path / "recordings" / "a")  # collector first
+    assert rlt.bound_recordings(run) == str((tmp_path / "recordings" / "a").resolve())
+    rlt.bind_recordings(run, tmp_path / "recordings" / "a")  # learner agrees
+    with pytest.raises(ValueError, match="换录制目录"):
+        rlt.bind_recordings(run, tmp_path / "eval" / "a")
 
 
 def test_publication_is_atomic_versioned_and_config_bound(tmp_path):
@@ -126,7 +172,6 @@ def test_td3_learner_improves_on_the_reference(reward_scale):
             rlt.pad_committed([], zero, SMALL),
             np.zeros((2, 14)),
             zero,
-            explore=False,
         )[1]
     )
     reference = regret(lambda t: np.zeros(SMALL.action_dim))

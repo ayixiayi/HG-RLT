@@ -61,7 +61,7 @@ class RLTConfig:
     # BC anchor toward the reference / human chunk, on the per-dimension mean
     # squared residual (dimension-independent); Q is normalized by mean |Q|.
     beta: float = 5.0
-    actor_std: float = 0.05  # exploration, normalized units
+    actor_std: float = 0.05  # exploration target per decision, normalized units
     action_scale: float = 0.5  # rad per normalized unit of residual
     ref_dropout: float = 0.5
     utd: int = 5
@@ -198,13 +198,12 @@ def actor_mean(params, state, ref, xp=np):
 
 
 class Actor:
-    """NumPy actor for the collector: deterministic mean plus fixed-std noise."""
+    """NumPy actor for the collector: the deterministic mean chunk."""
 
-    def __init__(self, config, params, *, version=0, seed=0):
+    def __init__(self, config, params, *, version=0):
         self.config, self.params, self.version = config, params, version
-        self._rng = np.random.default_rng(seed)
 
-    def act(self, token, proprio_vec, committed, ref_chunk, qpos, *, explore=True):
+    def act(self, token, proprio_vec, committed, ref_chunk, qpos):
         """``committed``: (lead, 14) padded absolute targets already fixed."""
         cfg = self.config
         state = np.concatenate(
@@ -218,10 +217,6 @@ class Actor:
             raise ValueError("RL token / proprio size does not match the actor")
         ref = to_residual(ref_chunk, qpos, cfg)
         mean = actor_mean(self.params, state[None], ref[None])[0]
-        if explore and cfg.actor_std > 0:
-            mean = np.clip(
-                mean + cfg.actor_std * self._rng.standard_normal(mean.shape), -1, 1
-            )
         if not np.isfinite(mean).all():
             raise ValueError("Actor produced non-finite actions")
         return from_residual(mean, qpos, cfg), mean.astype(np.float32)
@@ -229,28 +224,45 @@ class Actor:
 
 class RLAgent:
     """Collector-side decision maker: latest published actor (or the initial,
-    reference-following one), plus a hard bound on deviation from ã."""
+    reference-following one), smooth exploration, and a hard bound on
+    deviation from ã.
+
+    Exploration is an offset that, over the executed steps, ramps from the
+    offset of the last executed command to a fresh Gaussian target, so
+    commands stay continuous across RL chunks (per-step white noise made the
+    arm shake at 30 Hz)."""
 
     def __init__(
-        self, config, actor_directory, *, max_deviation=0.15, seed=0, policy_id=None
+        self, config, actor_directory, *, max_deviation=0.15, seed=None, policy_id=None
     ):
         if max_deviation <= 0:
             raise ValueError("max_deviation must be positive")
         self.config, self.chunk = config, config.chunk
         self.max_deviation = max_deviation
-        self.watcher = ActorWatcher(
-            actor_directory, config, seed=seed, policy_id=policy_id
-        )
-        self._initial = Actor(config, init_actor(config), version=0, seed=seed)
+        self.watcher = ActorWatcher(actor_directory, config, policy_id=policy_id)
+        self._initial = Actor(config, init_actor(config), version=0)
+        self._rng = np.random.default_rng(seed)
 
-    def decide(self, token, qpos, previous_qpos, reference, committed=()):
+    def decide(self, token, qpos, previous_qpos, reference, committed=(), skip=0):
         """``reference``: VLA chunk aligned to the observation; ``committed``:
-        the steps already fixed at that observation (at most ``lead``)."""
+        the steps already fixed at that observation (at most ``lead``);
+        ``skip``: how many steps ran before this chunk takes over."""
+        cfg = self.config
         actor = self.watcher.poll() or self._initial
         state = proprio(qpos, previous_qpos)
         reference = np.asarray(reference, dtype=np.float64)
-        committed = pad_committed(committed, qpos, self.config)
-        actions, _ = actor.act(token, state, committed, reference, qpos)
+        ran = len(np.asarray(committed, dtype=np.float64).reshape(-1, JOINTS))
+        committed = pad_committed(committed, qpos, cfg)
+        mean, _ = actor.act(token, state, committed, reference, qpos)
+        start = min(int(skip), cfg.chunk)
+        offset = np.zeros(JOINTS)
+        if ran and start:
+            # committed[j] ran at step j; padding repeats the held last one.
+            offset = committed[min(start, cfg.lead) - 1] - mean[start - 1]
+        target = cfg.actor_std * cfg.action_scale * self._rng.standard_normal(JOINTS)
+        steps = np.arange(cfg.chunk) - start + 1
+        ramp = np.clip(steps / (cfg.chunk - start + 1), 0.0, 1.0)[:, None]
+        actions = mean + offset + (target - offset) * ramp
         bound = np.full(JOINTS, self.max_deviation)
         bound[[6, 13]] = 2 * self.max_deviation  # normalized grippers
         actions = reference + np.clip(actions - reference, -bound, bound)
@@ -290,6 +302,14 @@ def bind_run(run, policy_id):
     marker.write_text(json.dumps({"policy_id": policy_id}) + "\n")
 
 
+def bound_recordings(run):
+    """The recording directory RUN reads, or None before the first binding."""
+    marker = Path(run) / "recordings.json"
+    if not marker.exists():
+        return None
+    return json.loads(marker.read_text())["recordings"]
+
+
 def bind_recordings(run, recordings):
     """One RLT run reads one recording directory: replay shards are keyed by
     episode file name, so another directory's episode-000001 would be taken
@@ -297,13 +317,14 @@ def bind_recordings(run, recordings):
     run = Path(run)
     marker = run / "recordings.json"
     source = str(Path(recordings).resolve())
-    if marker.exists():
-        bound = json.loads(marker.read_text())["recordings"]
+    bound = bound_recordings(run)
+    if bound is not None:
         if bound != source:
             raise ValueError(
                 f"RLT 运行目录 {run} 读取的是 {bound}；换录制目录请用新的 --run"
             )
         return
+    run.mkdir(parents=True, exist_ok=True)
     _atomic_write(marker, (json.dumps({"recordings": source}) + "\n").encode())
 
 
@@ -419,12 +440,11 @@ def load_actor(directory, config, policy_id=None):
 class ActorWatcher:
     """Collector side: reload when a newer publication appears (block edges)."""
 
-    def __init__(self, directory, config, *, seed=0, policy_id=None):
+    def __init__(self, directory, config, *, policy_id=None):
         self.directory, self.config = Path(directory), config
         self.policy_id = policy_id
         self._mtime = None
         self.actor = None
-        self._seed = seed
 
     def poll(self):
         path = self.directory / "actor.npz"
@@ -434,7 +454,7 @@ class ActorWatcher:
             return self.actor
         if mtime != self._mtime:
             params, version = load_actor(self.directory, self.config, self.policy_id)
-            self.actor = Actor(self.config, params, version=version, seed=self._seed)
+            self.actor = Actor(self.config, params, version=version)
             self._mtime = mtime
         return self.actor
 

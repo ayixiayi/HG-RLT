@@ -334,6 +334,9 @@ def test_session_argv_is_built_only_from_validated_fields(lab, tmp_path):
     assert baseline["port"] == webui.BASELINE_PORT
     rlt = console.session_plan(SESSION | {"rlt": "rlt1"})
     assert rlt["argv"][-2:] == ["--rlt", str(root / "data/rlt/rlt1")]
+    # RLT episodes always land where rlt-learn reads them, whatever the kind.
+    assert rlt["kind"] == "recordings" and rlt["argv"][2:4] == [
+        "--output-dir", str(root / "data/recordings/1016-r1")]
 
     outside = tmp_path / "outside"
     deployment(outside.parent, "outside-model", 9100)

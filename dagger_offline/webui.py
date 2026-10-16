@@ -640,6 +640,8 @@ class Console:
         kind = p.get("kind", "eval")
         if kind not in ("eval", "recordings"):
             raise Refused("类型只能是 eval（评估）或 recordings（采集）", 400)
+        if p.get("rlt"):
+            kind = "recordings"  # rlt-learn reads data/recordings/<目录名>
         model = p.get("deployment", "baseline")
         deployment, port, _ = self.deployment(model if isinstance(model, str) else "")
         name = self._name(p.get("name"), "目录名")
@@ -656,7 +658,7 @@ class Console:
                 raise Refused("RLT 需要带 RL token 的封存模型，baseline 不能用 --rlt", 400)
             rlt_dir = self._inside(self.data_dir / "rlt" / self._name(rlt, "RLT 目录名"), self.data_dir, "RLT 目录")
             argv += ["--rlt", str(rlt_dir)]
-        return {"argv": argv, "output": str(output), "port": port, "deployment": model}
+        return {"argv": argv, "output": str(output), "port": port, "deployment": model, "kind": kind}
 
     # -- state
 
@@ -851,7 +853,7 @@ class Console:
             if plan["port"] not in listening:
                 raise Refused(f"端口 {plan['port']} 没有模型服务在监听；先在“模型”页启动并等它开始监听")
             label = f"{params.get('command', 'collect')} → {Path(plan['output']).relative_to(self.root)}"
-            meta = {k: plan[k] for k in ("output", "port", "deployment")} | {"kind": params.get("kind", "eval")}
+            meta = {k: plan[k] for k in ("output", "port", "deployment", "kind")}
             job = self._spawn("session", label, plan["argv"], meta=meta, pty=True)
         return job.snapshot()
 

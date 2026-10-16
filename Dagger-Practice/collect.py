@@ -44,6 +44,19 @@ def main():
         return
     if not sys.stdin.isatty():
         raise RuntimeError("连续采集需要现场操作者的交互终端")
+    if args.rlt is not None:
+        # rlt-learn trains only on the directory bound to the run; recording
+        # anywhere else would never reach the actor.
+        from dagger_offline import rlt
+
+        try:
+            rlt.bind_recordings(args.rlt, args.output_dir)
+        except ValueError:
+            bound = rlt.bound_recordings(args.rlt)
+            raise ValueError(
+                f"RLT 运行目录 {args.rlt} 的 rlt-learn 读取 {bound}；"
+                f"--output-dir 请用这个目录，或换新的 --rlt 目录"
+            ) from None
 
     from run_robot import execute, preflight, prepare_start
 

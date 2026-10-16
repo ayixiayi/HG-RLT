@@ -48,6 +48,7 @@
         </label>
         <label>RLT 目录名（可选，data/rlt/…）<input name="rlt" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" maxlength="64" autocomplete="off" placeholder="不用 RLT 留空"></label>
       </div>
+      <div class="row hint">填了 RLT 目录名时固定存到 data/recordings/目录名；rlt-learn 用同一个目录：--recordings data/recordings/目录名 --run data/rlt/RLT 目录名</div>
       <pre id="session-plan" class="plan"></pre>
       <div class="actions"><button class="primary" type="submit">开始…</button></div>
       <p class="error" id="session-error"></p>

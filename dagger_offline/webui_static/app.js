@@ -341,6 +341,10 @@ function formParams() {
 }
 let planTimer;
 function updatePlan() {
+  // RLT episodes are the learner's data: always data/recordings/<目录名>.
+  const rlt = fields.rlt.value.trim() !== "";
+  if (rlt) fields.kind.value = "recordings";
+  fields.kind.disabled = rlt;
   if (!nameEdited && fields.kind.value === "eval") fields.name.value = defaultName();
   clearTimeout(planTimer);
   planTimer = setTimeout(async () => {
