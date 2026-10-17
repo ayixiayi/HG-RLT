@@ -120,7 +120,7 @@ PROMPTS = {
     "确认下电：": "await_phrase",
     "确认启动并使能新 daemon：": "await_phrase",
 }
-NOTICES = {"跟随卡住", "策略拒绝", "故障", "采集停止", "采集结束", "检查点", "丢弃", "主臂"}
+NOTICES = {"跟随卡住", "策略拒绝", "故障", "采集停止", "采集结束", "检查点", "丢弃", "主臂", "无人操作"}
 STATS = re.compile(
     r"累计 (\d+) 条 · 成功 (\d+) · 失败 (\d+) · 弃用 (\d+) · 未完成 (\d+) · "
     r"未标结果 (\d+) · 纳入清单 (\d+) 条"
@@ -233,8 +233,10 @@ class SessionParser:
         elif label == "下一条":
             self.stage, self.mode, self.takeover, self.rl = "next", None, None, False
             self.episode = text.split("；")[0].strip()
-        elif label == "归零确认":
-            self.stage = "confirm_homing"
+        elif label == "归零确认" and "自动回零" in text:
+            self.stage = "homing"  # unattended: no prompt, nothing to answer
+        elif label == "无人操作":
+            self.stage = "ending"
         elif label in ("归零完成", "现场检查"):
             self.stage = "starting"
         elif label == "故障":

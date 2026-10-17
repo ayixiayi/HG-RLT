@@ -775,8 +775,18 @@ def test_parser_follows_the_real_console_lines(chunk):
     assert states[-1]["stage"] == "await_start" and states[-1]["episode"] == "episode-000003.h5"
     parser.typed("\r")
     assert parser.stage == "starting"
-    feed("\n" + console_text(("归零确认", "双臂回零、夹爪张开")) + "按回车确认；输入其它内容或 Ctrl-C 取消：")
+    # The notice comes before the prompt; keys sent in between would be
+    # discarded with the input typed before the prompt, so wait for it.
+    feed("\n" + console_text(("归零确认", "双臂回零、夹爪张开")))
+    assert parser.stage == "starting"
+    feed("按回车确认；输入其它内容或 Ctrl-C 取消：")
     assert parser.stage == "confirm_homing"
+    # Unattended homing has no prompt and nothing to answer.
+    other = webui.SessionParser()
+    other.feed(console_text(("无人操作", "10 分钟无人操作：自动回零后结束采集")))
+    assert other.stage == "ending"
+    other.feed(console_text(("归零确认", "10 分钟无人操作：自动回零，不等现场确认")))
+    assert other.stage == "homing"
     parser.typed("\r")
     assert parser.stage == "homing"
     feed("\n" + console_text(("归零完成", "反馈已到位"), ("操作", "按键直接生效"), ("mode", "HOLD")))

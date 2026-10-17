@@ -3,6 +3,7 @@
 import argparse
 import signal
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,11 +87,29 @@ def main():
             {**metadata, "collection": {"group": group}},
         )
 
+    def home_unattended():
+        # Its own log under homing/: not an episode, never renumbers one.
+        folder = Path(args.output_dir) / "homing"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        episode_args = SimpleNamespace(
+            rhos_root=args.rhos_root,
+            abc=args.abc,
+            output=folder / f"idle-{stamp}.h5",
+            deployment=args.deployment,
+            passive_leaders=args.passive_leaders,
+            leader_on_demand=args.leader_on_demand,
+            rlt=args.rlt,
+        )
+        _, profile, _, reference, _ = preflight(episode_args)
+        prepare_start(episode_args, profile, reference, unattended=True)
+
     run_collection(
         args.output_dir,
         record_episode,
         episodes=args.episodes,
         group=args.group,
+        home_unattended=home_unattended,
     )
 
 

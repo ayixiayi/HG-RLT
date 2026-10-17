@@ -222,8 +222,18 @@ function renderSession() {
   $("#session-view").hidden = !job;
   $("#session-term-card").hidden = !job;
   const chip = $("#mode-chip");
+  // Every tab: a session stays live until it ends, closing the page does not end it.
+  const alert = $("#session-alert");
+  alert.hidden = !running;
   if (!job) { chip.hidden = true; return; }
   const s = job.state || {};
+  if (running) {
+    $("#session-alert-text").textContent =
+      `采集进行中：${s.episode || job.label}${STAGE_TEXT[s.stage] ? ` · ${STAGE_TEXT[s.stage]}` : ""}。` +
+      "关网页不会结束采集；离开前点“结束采集”，等到显示“已结束”。" +
+      "10 分钟无人按键（人工接管除外）：保存本条（不标结果），自动回零（不等确认）后结束采集。";
+    $("#btn-alert-stop").disabled = job.stopping;
+  }
   $("#session-label").textContent = job.label;
   $("#session-sub").textContent = running
     ? `PID ${job.pid} · 开始于 ${clock(job.started)}${job.stopping ? " · 正在结束…" : ""}`
@@ -315,6 +325,10 @@ document.addEventListener("keydown", (e) => {
   const k = e.key === "Enter" ? "enter" : e.key.toLowerCase();
   if (!"phscxkqr?123456".includes(k) && k !== "enter") return;
   if (k.length !== 1 && k !== "enter") return;
+  // Enter on a focused button (e.g. 结束采集) is that button's click, never an
+  // Enter for the prompt: at the homing prompt that would confirm motion.
+  // Pad buttons blur themselves after a click, so they keep no focus.
+  if (k === "enter" && e.target instanceof Element && e.target.closest("button")) return;
   e.preventDefault(); // Enter must not also click a focused button
   if (!$("#unlock").checked && k !== "s") {
     showNotice("先勾选“我在机械臂旁”再用键盘控制（s 保持始终可用）");
@@ -380,6 +394,7 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
+$("#btn-alert-stop").addEventListener("click", () => $("#btn-session-stop").click());
 $("#btn-session-stop").addEventListener("click", async () => {
   if (!confirm("结束采集：按当前阶段发送按键——录制中先 s 保持再 q 弃用本条（文件保留在 trash/），标记结果时记为弃用，等待开始时 q 结束。继续？")) return;
   try { await api("/api/session/stop", {}); } catch (err) { showNotice(err.message, true); }

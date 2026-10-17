@@ -1,11 +1,24 @@
 """Small, line-oriented Chinese CLI output; no terminal dependency or animation."""
 
+import codecs
 import contextlib
 import os
 import re
+import select
 import sys
+import termios
 import threading
 import time
+
+# Nobody at the keyboard for this long (outside a human takeover): the
+# collection saves what it has, homes the arms without waiting for a
+# confirmation, and ends. A session left alone must not wait for a stray key.
+IDLE_PROMPT_S = 600.0
+UNATTENDED = "unattended"  # run_loop / review result: nobody answered
+
+
+class Unattended(Exception):
+    """A prompt was not answered within IDLE_PROMPT_S."""
 
 
 def message(label, text, *, level="info", stream=None):
@@ -15,6 +28,58 @@ def message(label, text, *, level="info", stream=None):
     if stream.isatty() and "NO_COLOR" not in os.environ and os.getenv("TERM") != "dumb":
         prefix = f"\033[1;{colors[level]}m{prefix}\033[0m"
     print(f"{prefix} {text}", file=stream, flush=True)
+
+
+def timed_input(text, timeout_s=IDLE_PROMPT_S, *, stream=None):
+    """input() that returns None after ``timeout_s`` without any keystroke.
+
+    Only what is typed after the prompt counts: pending terminal input (a
+    second Enter from the previous prompt) is discarded first. On a terminal
+    every key restarts the timeout, not just a finished line: the line is
+    read key by key (non-canonical, still echoed), never buffered for a later
+    prompt. The answer is everything up to the newline."""
+    fd = (sys.stdin if stream is None else stream).fileno()
+    if not os.isatty(fd):
+        print(text, end="", flush=True)
+        ready, _, _ = select.select([fd], [], [], timeout_s)
+        if not ready:
+            print(flush=True)
+            return None
+        data = os.read(fd, 4096)
+        if not data:
+            raise EOFError
+        # Only a newline ends the answer: str.splitlines would also split at
+        # control characters (Ctrl-L "\x0cn" -> "", an empty confirmation).
+        return data.decode(errors="replace").split("\n", 1)[0].rstrip("\r")
+    saved = termios.tcgetattr(fd)
+    raw = termios.tcgetattr(fd)
+    raw[3] &= ~termios.ICANON  # keys one by one; ISIG (Ctrl-C) and ECHO stay
+    raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:  # set inside: a Ctrl-C right after tcsetattr still restores
+        termios.tcflush(fd, termios.TCIFLUSH)
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+        print(text, end="", flush=True)
+        line = ""
+        while True:
+            ready, _, _ = select.select([fd], [], [], timeout_s)
+            if not ready:
+                print(flush=True)
+                return None
+            data = os.read(fd, 4096)
+            if not data:
+                raise EOFError
+            for char in decoder.decode(data):
+                if char in "\n\r":  # Enter (ICRNL may already map \r)
+                    return line
+                if char == "\x04" and not line:  # Ctrl-D on an empty line
+                    raise EOFError
+                if char in "\x7f\x08":
+                    line = line[:-1]  # one character, not one byte
+                elif char != "\x04":
+                    line += char
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def show_mode(state, *, waiting_for_policy=False):

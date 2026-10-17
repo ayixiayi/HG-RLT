@@ -128,3 +128,96 @@ def test_trash_moves_preparation_log_and_never_overwrites(tmp_path):
     assert (tmp_path / "trash/episode-000007.h5").read_text() == "first"
     assert not list((tmp_path / "episodes").iterdir())
     assert max(episode_numbers(tmp_path)) == 7
+
+
+def test_unattended_collection_homes_then_ends(tmp_path):
+    from dagger_offline.console import UNATTENDED, Unattended
+
+    # Next-episode prompt unanswered: home, end, nothing recorded.
+    calls, homed = [], []
+    manifest = run_collection(
+        tmp_path / "a",
+        lambda path, group: calls.append(path),
+        prompt=lambda _: None,
+        home_unattended=lambda: homed.append(1),
+    )
+    assert calls == [] and homed == [1] and manifest.exists()
+    # Homing confirmation unanswered (no motion yet): home, end.
+    homed = []
+
+    def unconfirmed(path, group):
+        raise Unattended("归零确认无人回应")
+
+    run_collection(tmp_path / "b", unconfirmed, episodes=3, prompt=lambda _: "",
+                   home_unattended=lambda: homed.append(1))
+    assert homed == [1]
+    # Nobody in the episode: it returns UNATTENDED, then home, end.
+    homed, ran = [], []
+
+    def idle_episode(path, group):
+        ran.append(path)
+        return UNATTENDED
+
+    run_collection(tmp_path / "c", idle_episode, episodes=3, prompt=lambda _: "",
+                   home_unattended=lambda: homed.append(1))
+    assert len(ran) == 1 and homed == [1]
+
+
+def test_timed_input_returns_a_line_or_none_after_the_timeout(capsys):
+    import os
+
+    from dagger_offline.console import timed_input
+
+    read, write = os.pipe()
+    with os.fdopen(read) as stream, os.fdopen(write, "w") as writer:
+        assert timed_input("等：", 0.05, stream=stream) is None
+        writer.write("q\n")
+        writer.flush()
+        assert timed_input("等：", 1.0, stream=stream) == "q"
+        writer.close()
+        with pytest.raises(EOFError):
+            timed_input("等：", 1.0, stream=stream)
+    assert capsys.readouterr().out.startswith("等：")
+
+
+def test_timed_input_ignores_lines_typed_before_the_prompt():
+    import os
+    import pty
+
+    from dagger_offline.console import timed_input
+
+    # A second Enter from the previous prompt must not confirm the next one.
+    import threading
+    import time
+
+    leader, follower = pty.openpty()
+    try:
+        with os.fdopen(os.dup(follower)) as stream:
+            os.write(leader, b"\n")
+            time.sleep(0.1)  # let the line discipline queue it
+            assert timed_input("", 0.3, stream=stream) is None
+            # Typed after the prompt: that one counts.
+            threading.Timer(0.1, os.write, (leader, b"n\n")).start()
+            assert timed_input("", 2.0, stream=stream) == "n"
+            # A control character before the text still cancels: the answer
+            # is everything up to the newline, never an empty confirmation.
+            threading.Timer(0.1, os.write, (leader, b"\x0cn\n")).start()
+            assert timed_input("", 2.0, stream=stream) == "\x0cn"
+            # Every key restarts the timeout, not only a finished line.
+            threading.Timer(0.2, os.write, (leader, b"n")).start()
+            threading.Timer(0.45, os.write, (leader, b"\x7fq\r")).start()
+            assert timed_input("", 0.35, stream=stream) == "q"
+            # Backspace removes a whole character; Ctrl-D on an empty line is EOF.
+            threading.Timer(0.1, os.write, (leader, "中".encode() + b"\x7fq\n")).start()
+            assert timed_input("", 2.0, stream=stream) == "q"
+            threading.Timer(0.1, os.write, (leader, b"\x04")).start()
+            with pytest.raises(EOFError):
+                timed_input("", 2.0, stream=stream)
+            # The terminal is back in canonical mode afterwards.
+            import termios
+
+            assert termios.tcgetattr(follower)[3] & termios.ICANON
+    finally:
+        os.close(leader)
+        os.close(follower)
+

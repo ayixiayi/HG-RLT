@@ -24,7 +24,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dagger_offline.console import driver_output, message, show_controls, show_mode
+from dagger_offline.console import (
+    IDLE_PROMPT_S,
+    UNATTENDED,
+    Unattended,
+    driver_output,
+    message,
+    show_controls,
+    show_mode,
+    timed_input,
+)
 
 REVISION = "d0832d12651d1b260a652861a14648dc5f3660c7"
 
@@ -42,7 +51,9 @@ def keyboard():
         data = os.read(fd, 4096)
         if not data:
             raise EOFError("Operator terminal closed")
-        return list(data.decode("ascii", errors="ignore").lower())
+        # Non-ASCII input is no command but still operator activity: keep it
+        # as U+FFFD, which no key handler matches.
+        return list(data.decode("ascii", errors="replace").lower())
 
     try:
         tty.setcbreak(sys.stdin.fileno())
@@ -247,22 +258,29 @@ class Snapshot:
     leader_times: dict
 
 
-def review_outcome(poll, clock=time):
+def review_outcome(poll, clock=time, idle_s=IDLE_PROMPT_S):
     """Ask for the task result only after confirmed HOLD and lease release.
 
-    A failure also asks for its type; returns ("fail", type) in that case.
+    A failure also asks for its type; returns ("fail", type) in that case, and
+    UNATTENDED when no key comes for ``idle_s`` (the episode stays unlabelled).
     """
     from dagger_offline.live_recording import FAILURE_TYPES
 
     message("结果标记", "1 成功 · 2 失败 · 3 弃用；直接按键，无需回车")
     choices = {"1": "success", "2": "fail", "3": "discard", "q": "discard"}
     outcome = None
+    asked = clock.monotonic()
     while outcome is None:
-        for key in poll():
+        keys = poll()
+        for key in keys:
             if key in choices:
                 outcome = choices[key]
                 break
         else:
+            if keys:
+                asked = clock.monotonic()
+            elif clock.monotonic() - asked > idle_s:
+                return UNATTENDED
             clock.sleep(0.05)
     if outcome != "fail":
         return outcome
@@ -271,10 +289,16 @@ def review_outcome(poll, clock=time):
         "失败类型",
         " · ".join(f"{i} {FAILURE_TYPES[t]}" for i, t in enumerate(types, 1)),
     )
+    asked = clock.monotonic()
     while True:
-        for key in poll():
+        keys = poll()
+        for key in keys:
             if key.isdigit() and 1 <= int(key) <= len(types):
                 return outcome, types[int(key) - 1]
+        if keys:
+            asked = clock.monotonic()
+        elif clock.monotonic() - asked > idle_s:
+            return UNATTENDED
         clock.sleep(0.05)
 
 
@@ -290,6 +314,7 @@ def run_loop(
     clock=time,
     review=None,
     leaders=None,
+    idle_s=IDLE_PROMPT_S,
 ):
     """The real single-sender loop, also exercised with fake I/O and clock.
 
@@ -325,6 +350,17 @@ def run_loop(
     last_follower = None
     pending_keys = []
     armed = None  # takeover confirmation state while pending (see below)
+    last_input = clock.monotonic()  # a key, or a human holding the leaders
+    keyboard_poll = poll
+
+    def poll():
+        # Every key read anywhere below is operator activity, including keys
+        # later dropped as stale (e.g. h / p / r right after a rejection).
+        nonlocal last_input
+        keys = keyboard_poll()
+        if keys:
+            last_input = clock.monotonic()
+        return keys
 
     def ns(value=None):
         return int((clock.monotonic() if value is None else value) * 1_000_000_000)
@@ -373,22 +409,35 @@ def run_loop(
                 leaders.raise_if_failed()
             lease.pulse()
             keys, pending_keys = pending_keys + poll(), []
+            if keys or control.owner is Ownership.HUMAN or armed is not None:
+                last_input = max(last_input, tick)
+            unattended = not keys and tick - last_input > idle_s
+            if unattended:
+                message(
+                    "无人操作",
+                    f"{idle_s / 60:.0f} 分钟无人操作：保持并保存本条（不标结果），随后回零并结束采集",
+                    level="warning",
+                )
             if "?" in keys:
                 show_controls()
-            if "q" in keys or "k" in keys:
+            if "q" in keys or "k" in keys or unattended:
                 # Stop local proposals before waiting for status/HOLD/release.
                 # Their latency must not age a stopped human controller into FAULT.
                 control.control("s", now=clock.monotonic(), qpos=sender.feedback)
                 lease.close()
-                event("finish", force=True)
+                event("unattended" if unattended else "finish", force=True)
                 # Publication requires confirmed HOLD AND exclusive release.
                 outcome = (
                     "discard"
                     if "q" in keys
+                    else "unlabelled"
+                    if unattended
                     else review()
                     if review is not None
                     else "unlabelled"
                 )
+                if outcome == UNATTENDED:  # nobody labelled it
+                    outcome, unattended = "unlabelled", True
                 failure_type = None
                 if isinstance(outcome, tuple):
                     outcome, failure_type = outcome
@@ -414,7 +463,7 @@ def run_loop(
                     else "已确认 HOLD 并释放控制权；整条记录标记不可用。没有删除原文件。",
                     level="success" if keep else "warning",
                 )
-                return outcome
+                return UNATTENDED if unattended else outcome
             if interrupting(keys):
                 control.control("s", now=clock.monotonic(), qpos=sender.feedback)
                 lease.hold("operator ownership boundary")
@@ -781,7 +830,10 @@ def run_loop(
         raise
 
 
-def prepare_start(args, profile, reference):
+def prepare_start(args, profile, reference, *, unattended=False):
+    """Home both arms after an on-site confirmation; ``unattended``: without
+    one (nobody has operated for IDLE_PROMPT_S). An unanswered confirmation
+    raises Unattended before any motion."""
     if not sys.stdin.isatty():
         raise RuntimeError("Preparation requires the onsite operator's terminal")
     from gello.safety.rpc import SafetyClient
@@ -790,13 +842,23 @@ def prepare_start(args, profile, reference):
     from dagger_offline.homing import move_to_start
 
     def confirm(_legacy_prompt):
+        if unattended:
+            message(
+                "归零确认",
+                f"{IDLE_PROMPT_S / 60:.0f} 分钟无人操作：自动回零，不等现场确认",
+                level="warning",
+            )
+            return
         message(
             "归零确认",
             "双臂回零、夹爪张开：沿用数采插值，每帧 ≤0.01 rad、30 Hz。\n"
             "请确认完整运动路径无障碍；关节限位不能检测碰撞。",
             level="warning",
         )
-        if input("按回车确认；输入其它内容或 Ctrl-C 取消："):
+        answer = timed_input("按回车确认；输入其它内容或 Ctrl-C 取消：")
+        if answer is None:
+            raise Unattended("归零确认无人回应")
+        if answer:
             raise RuntimeError("已取消归零，未发送运动指令")
 
     with ExitStack() as stack:

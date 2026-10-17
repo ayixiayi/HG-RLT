@@ -233,7 +233,9 @@ class Harness:
         keys, self.inbox = self.inbox + self.keys.pop(self.clock.tick, []), []
         return keys
 
-    def run(self, recorder_factory=EpisodeRecorder, *, review=None, metadata=None):
+    def run(
+        self, recorder_factory=EpisodeRecorder, *, review=None, metadata=None, **loop
+    ):
         with recorder_factory(
             self.path,
             task_name="choose_the_heavier_one",
@@ -244,7 +246,7 @@ class Harness:
             },
         ) as recorder:
             self.recorder = recorder
-            runner.run_loop(
+            return runner.run_loop(
                 control=self.control,
                 sender=self.sender,
                 lease=self.lease,
@@ -258,6 +260,7 @@ class Harness:
                 clock=self.clock,
                 review=review,
                 leaders=self.leaders,
+                **loop,
             )
 
 
@@ -487,6 +490,41 @@ def test_late_inference_cannot_override_takeover_and_handback_is_fresh(tmp_path)
     assert all(owner is Ownership.HUMAN for t, owner, _ in h.sent if 3 <= t < 25)
     assert any(owner is Ownership.POLICY for _, owner, _ in h.sent)
     assert h.worker.requests[1][0].observed_at > 10 + 25 / 30
+
+
+def test_keys_dropped_after_a_rejection_still_count_as_operator_activity(tmp_path):
+    from rhospolicy.inference.yam_act import apply_tracking_backpressure, plan_action
+
+    def rejecting(path, idle_s):
+        # The first chunk is rejected; the operator presses p right then (that
+        # key is discarded as stale) and again at tick 52, then k at 86.
+        h = Harness(path, {0: ["p"], 52: ["p"], 86: ["k"]})
+        poll, rejected = h.worker.poll, []
+
+        def policy():
+            result = poll()
+            if result is not None and len(h.worker.requests) == 1:
+                result[1][3:, 4] += 0.31
+            return result
+
+        def plan(*args, **kwargs):
+            result = plan_action(*args, **kwargs)
+            if result.violations and not rejected:
+                rejected.append(h.clock.tick)
+                h.inbox.append("p")
+            return result
+
+        h.worker.poll, h.sender.plan = policy, plan
+        h.sender.backpressure = apply_tracking_backpressure
+        return h.run(idle_s=idle_s), rejected
+
+    outcome, rejected = rejecting(tmp_path / "a.h5", 600)
+    assert outcome == "unlabelled" and rejected and rejected[0] > 2
+    # Idle limit that only the key pressed at the rejection keeps alive.
+    idle_s = (52 - rejected[0] / 2) / 30
+    outcome, _ = rejecting(tmp_path / "b.h5", idle_s)
+    assert outcome == "unlabelled"
+
 
 
 @pytest.mark.parametrize("failure", [None, "hold", "lease", "deadline", "human"])
@@ -928,6 +966,7 @@ def test_execute_rejects_unattended_before_hardware_import(monkeypatch):
         (1.25, 0.035, "", None),
         (0.0, 0.041, "", "feedback did not settle"),
         (1.25, 0.0, "cancel", "已取消归零"),
+        (1.25, 0.0, None, "无人回应"),  # unanswered: Unattended, no motion
     ],
 )
 def test_prepare_start_full_range_feedback_and_confirmation(
@@ -947,7 +986,7 @@ def test_prepare_start_full_range_feedback_and_confirmation(
     monkeypatch.setattr("gello.safety.rpc.SafetyClient", lambda **kw: h.safety)
     monkeypatch.setattr("gello.zmq_core.robot_node.ZMQClientRobot", lambda **kw: h)
     monkeypatch.setattr(runner.sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", lambda prompt: confirmation)
+    monkeypatch.setattr(runner, "timed_input", lambda prompt: confirmation)
     monkeypatch.setattr(
         homing,
         "move_to_start",
@@ -964,12 +1003,12 @@ def test_prepare_start_full_range_feedback_and_confirmation(
         {"state": target.tolist()},
     )
     if error:
-        with pytest.raises(RuntimeError, match=error):
+        with pytest.raises((RuntimeError, runner.Unattended), match=error):
             prepare()
     else:
         prepare()
     assert h.safety.state == "safe_hold" and h.safety.session is None
-    if confirmation:
+    if confirmation != "":
         assert not h.sent
     else:
         commands = np.array([entry[2] for entry in h.sent])
@@ -2095,10 +2134,54 @@ def test_review_asks_failure_type_only_for_failures():
     from types import SimpleNamespace as NS
 
     keys = iter([["x"], ["2"], ["9"], ["3"]])
-    clock = NS(sleep=lambda _s: None)
+    clock = NS(sleep=lambda _s: None, monotonic=lambda: 0.0)
     assert runner.review_outcome(lambda: next(keys), clock) == ("fail", "drop")
     keys = iter([["1"]])
     assert runner.review_outcome(lambda: next(keys), clock) == "success"
+    # Nobody labels it: unattended after idle_s without a key, at either step.
+    now = [0.0]
+
+    def tick(seconds):
+        now[0] += seconds
+
+    idle = NS(sleep=tick, monotonic=lambda: now[0])
+    assert runner.review_outcome(lambda: [], idle, idle_s=5) == runner.UNATTENDED
+    keys = iter([["2"]])
+    assert (
+        runner.review_outcome(lambda: next(keys, []), idle, idle_s=5)
+        == runner.UNATTENDED
+    )
+
+
+def test_non_ascii_input_counts_as_activity_but_no_command(monkeypatch):
+    import os
+    import pty
+    import time
+
+    leader, follower = pty.openpty()
+    try:
+        with os.fdopen(os.dup(follower)) as terminal:
+            monkeypatch.setattr(runner.sys, "stdin", terminal)
+            with runner.keyboard() as poll:
+                os.write(leader, "你".encode())
+                time.sleep(0.1)
+                keys = poll()
+    finally:
+        os.close(leader)
+        os.close(follower)
+    assert keys and not set(keys) & set("phsrkqxc?123456")
+
+
+def test_unattended_episode_is_saved_unlabelled_and_reported(tmp_path, capsys):
+    # Policy runs and nobody touches anything: after idle_s the loop holds,
+    # keeps the recording without a label and tells collect to home and end.
+    h = Harness(tmp_path / "idle.h5", {0: ["p"]})
+    assert h.run(idle_s=2.0) == runner.UNATTENDED
+    assert h.safety.state == "safe_hold" and h.safety.session is None
+    with h5py.File(h.path) as f:
+        assert f.attrs["complete"] and f.attrs["outcome"] == "unlabelled"
+        assert "unattended" in f["dagger_events/reason"].asstr()[()].tolist()
+    assert "无人操作" in capsys.readouterr().out
 
 
 def test_failure_type_only_labels_failures(tmp_path):

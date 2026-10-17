@@ -10,7 +10,13 @@ from pathlib import Path
 
 import h5py
 
-from dagger_offline.console import message
+from dagger_offline.console import (
+    IDLE_PROMPT_S,
+    UNATTENDED,
+    Unattended,
+    message,
+    timed_input,
+)
 
 
 @contextmanager
@@ -47,6 +53,16 @@ def _move_to_trash(directory, path):
                 target = trash / f"{source.stem}.{suffix}{source.suffix}"
                 suffix += 1
             os.replace(source, target)
+
+
+def _end_unattended(home_unattended):
+    minutes = f"{IDLE_PROMPT_S / 60:.0f}"
+    if home_unattended is None:
+        message("采集停止", f"{minutes} 分钟无人操作，已结束本次采集", level="warning")
+        return
+    message("无人操作", f"{minutes} 分钟无人操作：自动回零后结束采集", level="warning")
+    home_unattended()
+    message("采集停止", f"{minutes} 分钟无人操作：已回零，结束本次采集", level="warning")
 
 
 def episode_numbers(directory):
@@ -135,8 +151,20 @@ def refresh_records(directory):
     return records, counts
 
 
-def run_collection(directory, record_episode, *, episodes=0, group=None, prompt=input):
-    """One manual start per attempt; the callback owns zeroing and safe recording."""
+def run_collection(
+    directory,
+    record_episode,
+    *,
+    episodes=0,
+    group=None,
+    prompt=timed_input,
+    home_unattended=None,
+):
+    """One manual start per attempt; the callback owns zeroing and safe recording.
+
+    Nobody answering for IDLE_PROMPT_S (at the next-episode prompt, the homing
+    confirmation, or inside an episode: ``record_episode`` returns UNATTENDED)
+    ends the collection after ``home_unattended()`` homes the arms."""
     if type(episodes) is not int or episodes < 0:
         raise ValueError("--episodes 为本次最多采集的次数，0 表示不限次数")
     if group is not None and (not isinstance(group, str) or not group.strip()):
@@ -148,14 +176,23 @@ def run_collection(directory, record_episode, *, episodes=0, group=None, prompt=
             index = 1 + max(episode_numbers(root), default=0)
             path = root / "episodes" / f"episode-{index:06d}.h5"
             message("下一条", f"{path.name}；重置场景后再开始，归零仍需现场确认")
-            answer = prompt("回车开始本条；q 结束本次连续采集：").strip().lower()
+            answer = prompt("回车开始本条；q 结束本次连续采集：")
+            if answer is None:
+                _end_unattended(home_unattended)
+                break
+            answer = answer.strip().lower()
             if answer == "q":
                 break
             if answer:
                 message("等待", "请按回车开始，或输入 q 结束")
                 continue
             try:
-                record_episode(path, group or f"hg:{uuid.uuid4().hex}")
+                result = record_episode(path, group or f"hg:{uuid.uuid4().hex}")
+            except Unattended:
+                # The homing confirmation timed out before any motion.
+                refresh_records(root)
+                _end_unattended(home_unattended)
+                break
             except BaseException:
                 try:
                     refresh_records(root)
@@ -164,6 +201,9 @@ def run_collection(directory, record_episode, *, episodes=0, group=None, prompt=
                 raise
             attempted += 1
             refresh_records(root)
+            if result == UNATTENDED:
+                _end_unattended(home_unattended)
+                break
         message("录制清单", str(root / "records.json"), level="success")
         message(
             "数据准备",
